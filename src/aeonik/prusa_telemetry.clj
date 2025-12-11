@@ -178,26 +178,30 @@
 (def format-for-display-xf
   "Transducer that formats metrics for display"
   (map (fn [{:keys [wall-time-str formatted-metrics] :as packet}]
-         (assoc packet :display-lines
-                (map (fn [m]
-                       (let [value-str (case (:type m)
-                                         :numeric (if (number? (:value m))
-                                                    (if (integer? (:value m))
-                                                      (format "%d" (:value m))
-                                                      (format "%.3f" (double (:value m))))
-                                                    (str (:value m)))
-                                         :error (str "ERROR: " (:error m))
-                                         :structured (str/join ", "
-                                                               (map (fn [[k v]]
-                                                                      (str k "=" v))
-                                                                    (:fields m)))
-                                         "unknown")]
-                         (format "[%s | %s] %-20s = %s"
-                                 wall-time-str
-                                 (or (:device-time-str m) "--------")
-                                 (:name m)
-                                 value-str)))
-                     formatted-metrics)))))
+         (-> packet
+             ;; Replace :metrics with formatted metrics that include :device-time-str
+             (assoc :metrics formatted-metrics)
+             ;; Add display lines
+             (assoc :display-lines
+                    (map (fn [m]
+                           (let [value-str (case (:type m)
+                                             :numeric (if (number? (:value m))
+                                                        (if (integer? (:value m))
+                                                          (format "%d" (:value m))
+                                                          (format "%.3f" (double (:value m))))
+                                                        (str (:value m)))
+                                             :error (str "ERROR: " (:error m))
+                                             :structured (str/join ", "
+                                                                   (map (fn [[k v]]
+                                                                          (str k "=" v))
+                                                                        (:fields m)))
+                                             "unknown")]
+                             (format "[%s | %s] %-20s = %s"
+                                     wall-time-str
+                                     (or (:device-time-str m) "--------")
+                                     (:name m)
+                                     value-str)))
+                         formatted-metrics))))))
 
 ;; ---- Server management ----
 

@@ -1,80 +1,265 @@
-# prusa_telemetry
+# Prusa Telemetry Dashboard
 
-FIXME: my new application.
+A real-time telemetry monitoring system for Prusa 3D printers. This application receives UDP telemetry packets from Prusa printers, processes them, and displays the data in a modern web dashboard with live updates via WebSocket.
 
-## Installation
+## Purpose
 
-Download from https://github.com/aeonik/prusa_telemetry
+This application provides:
+- **Real-time monitoring** of Prusa printer telemetry data (temperatures, positions, status, etc.)
+- **Web-based dashboard** with live updates
+- **Multiple data views**: Latest values table or packet history
+- **Structured data support**: Displays complex metrics like runtime stats, network info, and more
+
+## Architecture
+
+The system consists of three main components:
+
+1. **Telemetry Server** (`src/aeonik/prusa_telemetry.clj`)
+   - Listens for UDP packets on port 8514 (default)
+   - Parses binary telemetry data
+   - Processes data through transducer pipeline (sorting, formatting, time conversion)
+   - Provides processed stream for consumption
+
+2. **Web Server** (`src/aeonik/web_server.clj`)
+   - HTTP server on port 8080 (default)
+   - Serves static HTML/CSS/JavaScript
+   - WebSocket endpoint (`/ws`) for real-time data streaming
+   - Converts telemetry packets to JSON for client consumption
+
+3. **Web Dashboard** (`src-cljs/aeonik/app.cljs`)
+   - ClojureScript frontend using Hiccup-style rendering
+   - WebSocket client for receiving live updates
+   - Two view modes:
+     - **Latest Values**: Table showing current value for each metric
+     - **Packets**: Historical view of recent telemetry packets
+   - Controls: Pause, Clear, View Toggle
+
+## Commands
+
+### Build ClojureScript
+
+Compile the ClojureScript frontend to JavaScript:
+
+```bash
+clj -M:cljs build-cljs.clj
+```
+
+This generates:
+- `resources/app.js` - Main application loader
+- `target/cljs-out/` - Compiled JavaScript modules
+
+**Note**: You must rebuild ClojureScript after making changes to `src-cljs/` files.
+
+### Run the Application
+
+Start both the telemetry server and web server:
+
+```bash
+clj -M:run-web
+```
+
+Or with custom ports (telemetry port, web port):
+
+```bash
+clj -M:run-web 8514 8080
+```
+
+Default ports:
+- **Telemetry UDP**: 8514
+- **Web Server HTTP**: 8080
+
+### Development with Shadow-cljs (REPL-driven)
+
+For REPL-driven development with hot reloading - **it just works!**
+
+1. **Jack in with Calva**:
+   - In VS Code/Cursor: Use Calva's "Jack In" command
+   - When prompted, select `:app` as the build to connect to
+   - **Services auto-start** - the telemetry and web servers start automatically via `dev/user.clj`
+   - The REPL session will be created (you may see "waiting for shadow-cljs runtimes")
+   
+2. **Open the app in your browser**:
+   - Open `http://localhost:9630` (or 9631) in your browser
+   - This completes the REPL connection - the "waiting" message will disappear
+   - Shadow-cljs serves HTML/JS files from `resources/`
+   - The WebSocket automatically connects to the backend on port 8080
+
+**Service Management in REPL**:
+```clojure
+;; Check service status
+(user/status)
+
+;; Start all services (if not auto-started)
+(user/start!)
+
+;; Stop all services
+(user/stop!)
+
+;; Restart all services
+(user/restart!)
+
+;; Start/stop individual services
+(user/start-telemetry!)
+(user/start-web!)
+(user/stop-telemetry!)
+(user/stop-web!)
+```
+
+**Note**: 
+- Services auto-start when you jack in (configured in `dev/user.clj`)
+- Always access the app via `http://localhost:9630` during development for REPL support
+- The REPL will show "waiting for shadow-cljs runtimes" until you open the browser page
+- Once the browser loads, the REPL connection completes and you can evaluate ClojureScript code
+
+### Run Telemetry Server Only
+
+Run just the telemetry server (for debugging or console output):
+
+```bash
+clj -M:run-m
+```
+
+Or with custom port:
+
+```bash
+clj -M:run-m 8514
+```
+
+### Run Tests
+
+```bash
+clojure -T:build test
+```
+
+### Build Uberjar
+
+Create a standalone JAR file:
+
+```bash
+clojure -T:build ci
+```
+
+This creates `target/prusa_telemetry-0.1.0-SNAPSHOT.jar`
+
+Run the uberjar:
+
+```bash
+java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar [telemetry-port] [web-port]
+```
 
 ## Usage
 
-FIXME: explanation
+### Quick Start
 
-Run the project directly, via `:exec-fn`:
+1. **Build the frontend**:
+   ```bash
+   clj -M:cljs build-cljs.clj
+   ```
 
-    $ clojure -X:run-x
-    Hello, Clojure!
+2. **Start the server**:
+   ```bash
+   clj -M:run-web
+   ```
 
-Run the project, overriding the name to be greeted:
+3. **Open your browser**:
+   Navigate to `http://localhost:8080`
 
-    $ clojure -X:run-x :name '"Someone"'
-    Hello, Someone!
+4. **Configure your Prusa printer** to send telemetry to your machine's IP on port 8514
 
-Run the project directly, via `:main-opts` (`-m aeonik.prusa-telemetry`):
+### Dashboard Features
 
-    $ clojure -M:run-m
-    Hello, World!
+- **Connection Status**: Shows WebSocket connection state (Connected/Disconnected)
+- **View Toggle**: Switch between "Latest Values" and "Packets" views
+- **Pause**: Temporarily stop updating the display (data still received)
+- **Clear**: Clear all displayed data
 
-Run the project, overriding the name to be greeted:
+### Data Types
 
-    $ clojure -M:run-m Via-Main
-    Hello, Via-Main!
+The dashboard handles three metric types:
 
-Run the project's tests (they'll fail until you edit them):
+1. **Numeric**: Simple numeric values (temperatures, positions, etc.)
+2. **Structured**: Complex data with key-value pairs (runtime stats, network info, etc.)
+3. **Error**: Error messages from the printer
 
-    $ clojure -T:build test
+### Latest Values View
 
-Run the project's CI pipeline and build an uberjar (this will fail until you edit the tests to pass):
+Shows a table with:
+- **Sender**: IP address and port of the printer
+- **Metric**: Name of the metric
+- **Value**: Current value (formatted appropriately)
+- **Type**: Data type (numeric, structured, error)
+- **Time**: Device timestamp (if available)
 
-    $ clojure -T:build ci
+### Packets View
 
-This will produce an updated `pom.xml` file with synchronized dependencies inside the `META-INF`
-directory inside `target/classes` and the uberjar in `target`. You can update the version (and SCM tag)
-information in generated `pom.xml` by updating `build.clj`.
+Shows recent telemetry packets with:
+- Packet timestamp
+- Sender information
+- All metrics in that packet
+- Individual metric timestamps
 
-If you don't want the `pom.xml` file in your project, you can remove it. The `ci` task will
-still generate a minimal `pom.xml` as part of the `uber` task, unless you remove `version`
-from `build.clj`.
+## Development
 
-Run that uberjar:
+### Project Structure
 
-    $ java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar
+```
+prusa_telemetry/
+├── src/                    # Clojure source
+│   └── aeonik/
+│       ├── prusa_telemetry.clj  # UDP server & data processing
+│       └── web_server.clj       # HTTP/WebSocket server
+├── src-cljs/               # ClojureScript source
+│   └── aeonik/
+│       └── app.cljs       # Frontend application
+├── resources/              # Static assets
+│   ├── index.html         # Main HTML page
+│   └── app.js             # Generated ClojureScript loader
+├── target/                 # Build artifacts
+│   └── cljs-out/          # Compiled JavaScript
+├── build-cljs.clj         # ClojureScript build script
+└── deps.edn               # Dependencies
+```
 
-If you remove `version` from `build.clj`, the uberjar will become `target/prusa_telemetry-standalone.jar`.
+### Key Dependencies
 
-## Options
+- **aleph**: HTTP/WebSocket server
+- **manifold**: Stream processing
+- **clojure.data.json**: JSON serialization
+- **clojurescript**: Frontend compilation
 
-FIXME: listing of options this app accepts.
+### Making Changes
 
-## Examples
+1. **Backend changes** (`src/`): Just restart the server
+2. **Frontend changes** (`src-cljs/`): Rebuild with `clj -M:cljs build-cljs.clj` then refresh browser
+3. **HTML/CSS changes** (`resources/index.html`): Just refresh browser
 
-...
+### Debugging
 
-### Bugs
+- Check browser console (F12) for frontend errors
+- Server logs show WebSocket connections and data flow
+- Use `clj -M:run-m` to see raw telemetry data in console
 
-...
+## Configuration
 
-### Any Other Sections
-### That You Think
-### Might be Useful
+### Ports
+
+Default ports can be changed via command-line arguments:
+
+```bash
+# Custom telemetry and web ports
+clj -M:run-web 9000 3000
+```
+
+### Prusa Printer Configuration
+
+Configure your Prusa printer to send telemetry to:
+- **Host**: Your machine's IP address
+- **Port**: 8514 (or your custom port)
+
+Refer to your Prusa printer's documentation for telemetry configuration.
 
 ## License
 
 Copyright © 2025 Dave
-
-_EPLv1.0 is just the default for projects generated by `clj-new`: you are not_
-_required to open source this project, nor are you required to use EPLv1.0!_
-_Feel free to remove or change the `LICENSE` file and remove or update this_
-_section of the `README.md` file!_
 
 Distributed under the Eclipse Public License version 1.0.
