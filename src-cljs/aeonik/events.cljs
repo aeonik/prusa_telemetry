@@ -1,6 +1,162 @@
 (ns aeonik.events
   (:require [aeonik.state :refer [app-state]]
-            [aeonik.timeline :as timeline]))
+            [aeonik.timeline :as timeline]
+            [aeonik.util :as u]))
+
+;; ============================================================================
+;; WebSocket message handlers
+;; ============================================================================
+
+(defn- update-latest-values
+  [state sender metrics wall-time-str]
+  (let [old (:latest-values state)
+        new (reduce (fn [acc metric]
+                      (let [metric-name (:name metric)
+                            k          (str sender "/" metric-name)]
+                        (assoc acc k {:sender          sender
+                                      :name            metric-name
+                                      :value           (:value metric)
+                                      :fields          (:fields metric)
+                                      :error           (:error metric)
+                                      :type            (:type metric)
+                                      :tick            (:tick metric)
+                                      :device-time-us  (:device-time-us metric)
+                                      :device-time-str (:device-time-str metric)
+                                      :wall-time-str   wall-time-str})))
+                    old
+                    metrics)]
+    (assoc state :latest-values new)))
+
+(defn- append-timeline-metrics
+  [metrics sender wall-time-str]
+  (let [wall-time-ms (u/parse-wall-time-str wall-time-str)]
+    (map (fn [m]
+           {:sender          sender
+            :name            (:name m)
+            :value           (:value m)
+            :fields          (:fields m)
+            :error           (:error m)
+            :type            (:type m)
+            :tick            (:tick m)
+            :device-time-us  (:device-time-us m)
+            :device-time-str (:device-time-str m)
+            :wall-time-str   wall-time-str
+            :wall-time-ms    wall-time-ms})
+         metrics)))
+
+(defn- update-timeline-data
+  [state sender metrics wall-time-str print-filename]
+  (if (nil? print-filename)
+    state
+    (let [timeline-data   (:timeline-data state)
+          existing        (get timeline-data print-filename [])
+          new-metrics     (append-timeline-metrics metrics sender wall-time-str)
+          updated-list    (concat existing new-metrics)
+          timeline-data'  (assoc timeline-data print-filename updated-list)]
+      (assoc state :timeline-data timeline-data'))))
+
+(def ^:private packet-history-limit 50)
+
+(defn- update-telemetry-data
+  [state sender metrics wall-time-str]
+  (if (not= (:view-mode state) :packets)
+    state
+    (let [packet  {:sender sender
+                   :metrics metrics
+                   :wall-time-str wall-time-str}
+          updated (conj (:telemetry-data state) packet)
+          trimmed (if (> (count updated) packet-history-limit)
+                    (vec (take-last packet-history-limit updated))
+                    updated)]
+      (assoc state :telemetry-data trimmed))))
+
+(defn- time-range
+  [metrics]
+  (when (seq metrics)
+    (let [metrics-with-time (filter #(some? (:wall-time-ms %)) metrics)]
+      (when (seq metrics-with-time)
+        (let [times (map :wall-time-ms metrics-with-time)
+              min-t (apply min times)
+              max-t (apply max times)]
+          {:min min-t :max max-t})))))
+
+(defn- ensure-timeline-selection
+  [state print-filename]
+  (let [timeline-data (:timeline-data state)]
+    (if (or (nil? print-filename)
+            (empty? timeline-data))
+      state
+      (let [filenames        (keys timeline-data)
+            current-filename (or (:selected-filename state)
+                                 (first filenames))
+            all-metrics      (get timeline-data current-filename [])
+            {:keys [max] :as tr} (time-range all-metrics)]
+        (cond-> state
+          (and tr (nil? (:selected-time state)))
+          (assoc :selected-time max)
+
+          (and current-filename (nil? (:selected-filename state)))
+          (assoc :selected-filename current-filename))))))
+
+(defn- handle-ws-message
+  [state {:keys [sender metrics wall-time-str print-filename]}]
+  (if (:paused state)
+    state
+    (-> state
+        (update-latest-values sender metrics wall-time-str)
+        (update-timeline-data sender metrics wall-time-str print-filename)
+        (update-telemetry-data sender metrics wall-time-str)
+        (ensure-timeline-selection print-filename))))
+
+;; ============================================================================
+;; Timeline event handlers
+;; ============================================================================
+
+(def ^:private one-second-ms 1000)
+
+(defn- clamp-forward
+  [current {:keys [max]} step]
+  (when current
+    (min max (+ current step))))
+
+(defn- clamp-backward
+  [current {:keys [min]} step]
+  (when current
+    (max min (- current step))))
+
+(defn- handle-timeline-tick
+  [state {:keys [step-ms time-range]}]
+  (let [current (:selected-time state)
+        max-t   (:max time-range)]
+    (if (and current time-range (< current max-t))
+      (assoc state :selected-time (min max-t (+ current step-ms)))
+      (-> state
+          (assoc :timeline-playing false)
+          (assoc :timeline-interval nil)))))
+
+(defn- handle-step-forward
+  [state {:keys [time-range]}]
+  (if-let [new-t (clamp-forward (:selected-time state) time-range one-second-ms)]
+    (assoc state :selected-time new-t)
+    state))
+
+(defn- handle-step-backward
+  [state {:keys [time-range]}]
+  (if-let [new-t (clamp-backward (:selected-time state) time-range one-second-ms)]
+    (assoc state :selected-time new-t)
+    state))
+
+(defn- handle-jump-to-start
+  [state {:keys [time-range]}]
+  (assoc state :selected-time (:min time-range)))
+
+(defn- handle-jump-to-end
+  [state {:keys [time-range]}]
+  (assoc state :selected-time (:max time-range)))
+
+;; ============================================================================
+;; Main event handler
+;; ============================================================================
 
 (defn handle-event [state {:keys [type] :as ev}]
   (case type
@@ -11,60 +167,7 @@
     (assoc state :connected false)
 
     :ws/message
-    (let [{:keys [sender metrics wall-time-str print-filename]} ev
-          paused (:paused state)]
-      (if paused
-        state
-        (let [;; Update latest values map
-              latest-values-updated
-              (reduce (fn [acc metric]
-                        (let [metric-name (:name metric)
-                              key (str sender "/" metric-name)]
-                          (assoc acc key {:sender sender
-                                          :name metric-name
-                                          :value (:value metric)
-                                          :fields (:fields metric)
-                                          :error (:error metric)
-                                          :type (:type metric)
-                                          :tick (:tick metric)
-                                          :device-time-us (:device-time-us metric)
-                                          :device-time-str (:device-time-str metric)
-                                          :wall-time-str wall-time-str})))
-                      (:latest-values state)
-                      metrics)
-              ;; Update timeline data if we have a filename
-              timeline-data-updated
-              (if print-filename
-                (let [metrics-list (get (:timeline-data state) print-filename [])
-                      new-metrics (map (fn [m]
-                                         {:sender sender
-                                          :name (:name m)
-                                          :value (:value m)
-                                          :fields (:fields m)
-                                          :error (:error m)
-                                          :type (:type m)
-                                          :tick (:tick m)
-                                          :device-time-us (:device-time-us m)
-                                          :device-time-str (:device-time-str m)
-                                          :wall-time-str wall-time-str})
-                                       metrics)
-                      updated-list (concat metrics-list new-metrics)]
-                  (assoc (:timeline-data state) print-filename updated-list))
-                (:timeline-data state))
-              ;; Update telemetry data for packet view
-              telemetry-data-updated
-              (if (= (:view-mode state) :packets)
-                (let [updated (conj (:telemetry-data state) {:sender sender
-                                                             :metrics metrics
-                                                             :wall-time-str wall-time-str})]
-                  (if (> (count updated) 50)
-                    (vec (take-last 50 updated))
-                    updated))
-                (:telemetry-data state))]
-          (-> state
-              (assoc :latest-values latest-values-updated)
-              (assoc :timeline-data timeline-data-updated)
-              (assoc :telemetry-data telemetry-data-updated)))))
+    (handle-ws-message state ev)
 
     :view/set
     (assoc state :view-mode (:mode ev))
@@ -94,52 +197,25 @@
     (assoc state :selected-time (:time ev))
 
     :timeline/play
-    (let [updated (assoc state :timeline-playing true)]
-      (timeline/update-loop!)
-      updated)
+    (assoc state :timeline-playing true)
 
     :timeline/stop
-    (let [updated (assoc state :timeline-playing false)]
-      (timeline/stop-loop!)
-      updated)
+    (assoc state :timeline-playing false)
 
     :timeline/tick
-    (let [step-us (:step-us ev)
-          current-time (:selected-time state)
-          time-range (:time-range ev)
-          max-time (:max time-range)]
-      (if (and current-time time-range (< current-time max-time))
-        (let [new-time (min max-time (+ current-time step-us))]
-          (assoc state :selected-time new-time))
-        (-> state
-            (assoc :timeline-playing false)
-            (assoc :timeline-interval nil))))
+    (handle-timeline-tick state ev)
 
     :timeline/step-forward
-    (let [time-range (:time-range ev)
-          current (:selected-time state)
-          max-time (:max time-range)
-          step (* 1000000 1)] ; 1 second
-      (if (and current (< current max-time))
-        (assoc state :selected-time (min max-time (+ current step)))
-        state))
+    (handle-step-forward state ev)
 
     :timeline/step-backward
-    (let [time-range (:time-range ev)
-          current (:selected-time state)
-          min-time (:min time-range)
-          step (* 1000000 1)] ; 1 second
-      (if (and current (> current min-time))
-        (assoc state :selected-time (max min-time (- current step)))
-        state))
+    (handle-step-backward state ev)
 
     :timeline/jump-to-start
-    (let [time-range (:time-range ev)]
-      (assoc state :selected-time (:min time-range)))
+    (handle-jump-to-start state ev)
 
     :timeline/jump-to-end
-    (let [time-range (:time-range ev)]
-      (assoc state :selected-time (:max time-range)))
+    (handle-jump-to-end state ev)
 
     :slider/drag-start
     (assoc state :slider-dragging true)

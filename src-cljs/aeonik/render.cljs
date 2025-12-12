@@ -1,6 +1,7 @@
 (ns aeonik.render
   (:require [aeonik.state :refer [app-state]]
-            [aeonik.views :as views]))
+            [aeonik.views :as views]
+            [aeonik.util :as u]))
 
 (defonce render-state
   (atom {:render-scheduled? false
@@ -69,32 +70,155 @@
   (when-let [node (hiccup->dom hiccup)]
     (.appendChild elem node)))
 
+(defn update-table-tbody! [table-selector metrics]
+  "Update only the tbody rows, preserving table structure and updating individual cells"
+  (let [table (.querySelector js/document table-selector)
+        tbody (when table (.querySelector table "tbody"))]
+    (when tbody
+      (let [existing-rows (array-seq (.-children tbody))
+            row-count (count existing-rows)
+            metric-count (count metrics)]
+        ;; Update or create rows
+        (doseq [[idx metric] (map-indexed vector metrics)]
+          (let [existing-row (when (< idx row-count)
+                              (aget (.-children tbody) idx))
+                row-key (str (:sender metric) "/" (:name metric))]
+            (if (and existing-row
+                     (.-cells existing-row)
+                     (>= (.-length (.-cells existing-row)) 2)
+                     (= (str (.-textContent (aget (.-cells existing-row) 0)) "/" 
+                             (.-textContent (aget (.-cells existing-row) 1))) row-key))
+              ;; Update existing row - only update cells that changed
+              (let [cells-array (.-cells existing-row)
+                    cell-count (.-length cells-array)]
+                (when (>= cell-count 5)
+                  (let [value-cell (aget cells-array 2)
+                        type-cell (aget cells-array 3)
+                        time-cell (aget cells-array 4)
+                        new-value (u/format-metric-value metric)
+                        new-type (:type metric)
+                        new-time (or (:device-time-str metric) "--------")]
+                    (when (and value-cell (not= (.-textContent value-cell) new-value))
+                      (set! (.-textContent value-cell) new-value))
+                    (when (and type-cell (not= (.-textContent type-cell) new-type))
+                      (set! (.-textContent type-cell) new-type))
+                    (when (and time-cell (not= (.-textContent time-cell) new-time))
+                      (set! (.-textContent time-cell) new-time)))))
+              ;; Create new row
+              (let [row (.createElement js/document "tr")
+                    create-cell (fn [text]
+                                  (let [td (.createElement js/document "td")]
+                                    (set! (.-textContent td) (str text))
+                                    td))]
+                (.appendChild row (create-cell (:sender metric)))
+                (.appendChild row (create-cell (:name metric)))
+                (.appendChild row (create-cell (u/format-metric-value metric)))
+                (.appendChild row (create-cell (:type metric)))
+                (.appendChild row (create-cell (or (:device-time-str metric) "--------")))
+                (if existing-row
+                  (.replaceChild tbody row existing-row)
+                  (.appendChild tbody row))))))
+        ;; Remove extra rows
+        (when (> row-count metric-count)
+          (loop [i (dec row-count)]
+            (when (>= i metric-count)
+              (let [row (aget (.-children tbody) i)]
+                (when row
+                  (.removeChild tbody row)))
+              (recur (dec i)))))))))
+
+(defn update-timeline-display-only! [& [override-time]]
+  "Update only timeline display elements without full DOM replacement.
+   If override-time is provided, use it instead of reading from state."
+  (let [state @app-state
+        filenames (keys (:timeline-data state))
+        current-filename (or (:selected-filename state) (first filenames))
+        all-metrics (get (:timeline-data state) current-filename [])
+        time-range (if (seq all-metrics)
+                    (let [metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
+                      (when (seq metrics-with-time)
+                        (let [times (map :wall-time-ms metrics-with-time)
+                              min-time (apply min times)
+                              max-time (apply max times)]
+                          {:min min-time :max max-time})))
+                    nil)
+        current-time (or override-time (:selected-time state))
+        metrics-at-time (if (and current-filename current-time)
+                         (u/get-metrics-at-time (:timeline-data state) current-filename current-time)
+                         [])
+        sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
+    ;; Update slider value
+    (when-let [slider (.getElementById js/document "time-slider")]
+      (set! (.-value slider) (str current-time)))
+    ;; Update time display
+    (when-let [time-display (.getElementById js/document "time-display")]
+      (set! (.-textContent time-display) (u/format-wall-time-ms current-time)))
+    ;; Update progress
+    (when-let [progress-span (.getElementById js/document "time-progress")]
+      (if time-range
+        (let [progress (* 100.0 (/ (- current-time (:min time-range))
+                                    (- (:max time-range) (:min time-range))))]
+          (set! (.-textContent progress-span) (str "(" (.toFixed progress 1) "%)")))
+        (set! (.-textContent progress-span) "")))
+    ;; Update metrics table tbody only
+    (update-table-tbody! "#content table.metrics" sorted-metrics)))
+
 (defn render! []
   (try
     (let [state @app-state
           status-el (.getElementById js/document "status")
           content-el (.getElementById js/document "content")]
-      ;; Initialize timeline state if needed
-      (when (= (:view-mode state) :timeline)
-        (let [filenames (keys (:timeline-data state))
-              current-filename (or (:selected-filename state) (first filenames))
-              all-metrics (get (:timeline-data state) current-filename [])
-              time-range (if (seq all-metrics)
-                          (let [min-time (apply min (map :device-time-us all-metrics))
-                                max-time (apply max (map :device-time-us all-metrics))]
-                            {:min min-time :max max-time})
-                          nil)]
-          (when (and time-range (nil? (:selected-time state)))
-            (swap! app-state assoc :selected-time (:max time-range)))
-          (when (and current-filename (nil? (:selected-filename state)))
-            (swap! app-state assoc :selected-filename current-filename))))
-      (when status-el
-        (replace-children! status-el (views/status-view state)))
-      (when content-el
-        (replace-children! content-el (views/main-view state))))
-    (swap! render-state assoc
-           :render-scheduled? false
-           :last-render-ms (js/Date.now))
+      ;; Don't do full render if user is dragging slider in timeline view
+      (if (and (:slider-dragging state) (= (:view-mode state) :timeline))
+        (update-timeline-display-only!)
+        (do
+          (when status-el
+            (replace-children! status-el (views/status-view state)))
+          (when content-el
+            (let [filenames (keys (:timeline-data state))
+                  current-filename (or (:selected-filename state) (first filenames))
+                  all-metrics (get (:timeline-data state) current-filename [])
+                  time-range (if (seq all-metrics)
+                              (let [metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
+                                (when (seq metrics-with-time)
+                                  (let [times (map :wall-time-ms metrics-with-time)
+                                        min-time (apply min times)
+                                        max-time (apply max times)]
+                                    {:min min-time :max max-time})))
+                              nil)
+                  has-table (.querySelector content-el "table.metrics")
+                  has-slider (.getElementById js/document "time-slider")]
+              (if (and (= (:view-mode state) :timeline)
+                       has-table
+                       (or has-slider (not time-range)))
+                ;; Timeline view with existing table - update tbody and slider only (if slider exists)
+                (let [current-time (or (:selected-time state) (when time-range (:max time-range)))
+                      metrics-at-time (if (and current-filename current-time)
+                                       (u/get-metrics-at-time (:timeline-data state) current-filename current-time)
+                                       [])
+                      sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
+                  ;; Update only the table tbody, preserve rest of DOM
+                  (update-table-tbody! "#content table.metrics" sorted-metrics)
+                  ;; Update slider if it exists and time-range exists
+                  (when (and time-range current-time has-slider)
+                    (let [slider (.getElementById js/document "time-slider")]
+                      (set! (.-value slider) (str current-time))
+                      (set! (.-min slider) (str (:min time-range)))
+                      (set! (.-max slider) (str (:max time-range)))))
+                  ;; Update other timeline elements if needed
+                  (when-let [time-display (.getElementById js/document "time-display")]
+                    (set! (.-textContent time-display) (u/format-wall-time-ms current-time)))
+                  (when-let [progress-span (.getElementById js/document "time-progress")]
+                    (if time-range
+                      (let [progress (* 100.0 (/ (- current-time (:min time-range))
+                                                  (- (:max time-range) (:min time-range))))]
+                        (set! (.-textContent progress-span) (str "(" (.toFixed progress 1) "%)")))
+                      (set! (.-textContent progress-span) ""))))
+                ;; Full render for other views, initial timeline render, or when slider needs to be created
+                (replace-children! content-el (views/main-view state)))))))
+      (swap! render-state assoc
+             :render-scheduled? false
+             :last-render-ms (js/Date.now)))
     (catch :default e
       (println "Error in render:" e)
       (js/console.error e))))
@@ -107,8 +231,13 @@
       (swap! render-state assoc :render-scheduled? true)
       (js/requestAnimationFrame render!))))
 
+;; Expose update-timeline-display-only! globally so views can call it
+(set! (.-updateTimelineDisplay js/window) update-timeline-display-only!)
+
 ;; Watch app-state for changes and schedule renders
+;; Skip render scheduling when slider is being dragged (it updates DOM directly)
 (add-watch app-state :render-watcher
            (fn [_ _ old new]
-             (when (not= old new)
+             (when (and (not= old new)
+                       (not (:slider-dragging new)))
                (schedule-render!))))

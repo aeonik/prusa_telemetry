@@ -43,7 +43,9 @@
 (defn get-metrics-at-time [timeline-data filename time-us]
   "Get the latest metric values at or before the given time"
   (let [all-metrics (get timeline-data filename [])
-        filtered (filter #(<= (:device-time-us %) time-us) all-metrics)
+        ;; Filter out metrics without device-time-us and those after the selected time
+        filtered (filter #(and (some? (:device-time-us %))
+                              (<= (:device-time-us %) time-us)) all-metrics)
         grouped (group-by (fn [m] (str (:sender m) "/" (:name m))) filtered)]
     (map (fn [[_key metrics]]
            (let [latest (last (sort-by :device-time-us metrics))]
