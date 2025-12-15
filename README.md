@@ -36,6 +36,25 @@ The system consists of three main components:
 
 ## Commands
 
+### Toolchain with mise
+
+We pin the local toolchain through [`mise`](https://mise.jdx.dev/) so the Clojure CLI version stays consistent across machines.
+
+1. Trust the repo config (one time):
+   ```bash
+   mise trust
+   ```
+2. Install the pinned CLI (see `.mise.toml` for the exact version):
+   ```bash
+   mise install clojure
+   ```
+3. Verify the CLI is available:
+   ```bash
+   mise exec -- clojure -Sdescribe
+   ```
+
+If an HTTP proxy blocks either `download.clojure.org` (Clojure installer) or `repo.clojars.org` (libraries), `mise install` will fail with a 403 response. Ensure both hosts are whitelisted and retry the install if you see that error.
+
 ### Build ClojureScript
 
 Compile the ClojureScript frontend to JavaScript:

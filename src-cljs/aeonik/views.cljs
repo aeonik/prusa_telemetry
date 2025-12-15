@@ -3,7 +3,8 @@
             [aeonik.events :refer [dispatch!]]
             [aeonik.state :as state]
             [aeonik.files :as files]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [reagent.core :as r]))
 
 (defn status-view [app-state]
   (if (:connected app-state)
@@ -105,10 +106,6 @@
                        (dispatch! {:type :slider/drag-end}))
            :oninput (fn [e]
                      (let [new-time (js/parseInt (aget e "target" "value"))]
-                       ;; Update display immediately with new time for real-time scrubbing
-                       (when-let [update-fn (aget js/window "updateTimelineDisplay")]
-                         (update-fn new-time))
-                       ;; Update state after display update
                        (dispatch! {:type :timeline/set-time :time new-time})))}])
 
 (defn- timeline-time-display [current-time time-range]
@@ -191,34 +188,21 @@
   (str (:date file-info) " - " (:filename file-info) " (" (.toFixed (/ (:size file-info) 1024) 1) " KB)"))
 
 (defn timeline-filename-selector [filenames current-filename available-files]
-  (let [;; Fetch files on first render if not already loaded
-        _ (when (empty? available-files)
-            (files/fetch-available-files!))
-        _ (println "timeline-filename-selector - available-files:" available-files "count:" (count available-files) "type:" (type available-files))
-        _ (println "timeline-filename-selector - filenames:" filenames "count:" (count filenames))
-        ;; Create a map of filename -> file-info for quick lookup
-        filename-to-file-info (reduce (fn [acc file-info]
-                                       (assoc acc (:filename file-info) file-info))
-                                     {}
-                                     available-files)
+  (let [filename-to-file-info (reduce (fn [acc file-info]
+                                        (assoc acc (:filename file-info) file-info))
+                                      {}
+                                      available-files)
         loaded-options (map (fn [fname]
-                             [:option {:value fname} fname])
-                           filenames)
+                              [:option {:value fname} fname])
+                            filenames)
         available-options (map (fn [file-info]
-                                (println "Creating option for file-info:" file-info)
-                                [:option {:value (str "file:" (:filename file-info))}
-                                 (format-file-option-label file-info)])
-                              available-files)
+                                 [:option {:value (str "file:" (:filename file-info))}
+                                  (format-file-option-label file-info)])
+                               available-files)
         options (concat
-                 ;; Empty option
                  [[:option {:value ""} "-- Select a file --"]]
-                 ;; First show loaded filenames
                  loaded-options
-                 ;; Then show available files with formatted labels
-                 available-options)
-        _ (println "timeline-filename-selector - loaded-options count:" (count loaded-options))
-        _ (println "timeline-filename-selector - available-options count:" (count available-options))
-        _ (println "timeline-filename-selector - total options count:" (count options))]
+                 available-options)]
     [:div {:class "filename-selector"}
      [:label {:for "filename-select"} "Print File: "]
      [:select {:id "filename-select"
@@ -229,22 +213,15 @@
                         (dispatch! {:type :dropdown/interact-end}))
                :onchange (fn [e]
                           (let [selected-value (aget e "target" "value")]
-                            (println "Selected value:" selected-value)
-                            ;; Use setTimeout to clear flag after change completes
-                            ;; This ensures the dropdown can finish its interaction
                             (js/setTimeout
                              (fn []
                                (dispatch! {:type :dropdown/interact-end}))
                              100)
-                            ;; Check if this is an available file that needs to be loaded
                             (if (str/starts-with? selected-value "file:")
-                              (let [actual-filename (subs selected-value 5) ; Remove "file:" prefix
+                              (let [actual-filename (subs selected-value 5)
                                     file-info (get filename-to-file-info actual-filename)]
-                                (println "Loading file:" actual-filename "file-info:" file-info)
                                 (when file-info
-                                  ;; File is not loaded yet, load it
-                                  (files/load-telemetry-file (:date file-info) actual-filename)))
-                              ;; For already loaded files, just set the filename
+                                  (files/load-telemetry-file! (:date file-info) actual-filename)))
                               (when (not= selected-value "")
                                 (dispatch! {:type :timeline/set-filename
                                            :filename selected-value})))))}
@@ -262,6 +239,12 @@
                          (u/get-metrics-at-time timeline-data current-filename current-time)
                          [])
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
+    (r/use-effect
+     (fn []
+       (when (empty? available-files)
+         (files/fetch-available-files!))
+       js/undefined)
+     #js [])
     [:div {:class "timeline-view"}
      [:div {:class "timeline-controls"}
       (timeline-filename-selector filenames current-filename available-files)
@@ -274,3 +257,53 @@
     :packets (packets-view app-state)
     :timeline (timeline-view app-state)
     (latest-view app-state)))
+
+(defn view-toggle-label
+  "Parameters: view-mode keyword representing the current view.
+   Returns: string label for the view toggle button."
+  [view-mode]
+  (case view-mode
+    :latest "Show Packets"
+    :packets "Show Timeline"
+    :timeline "Show Latest"
+    "Show Packets"))
+
+(defn header-controls
+  "Parameters: app-state map, timeline-page? boolean flag.
+   Returns: hiccup vector describing the header controls."
+  [app-state timeline-page?]
+  (let [{:keys [paused view-mode]} app-state
+        toggle-label (view-toggle-label view-mode)]
+    [:div {:class "header-controls"}
+     [:div {:class "status"}
+      (status-view app-state)]
+     (if timeline-page?
+       [:a {:href "/" :style {:text-decoration "none"}}
+        [:button {:class "secondary"} "Back to Dashboard"]]
+       [:<>
+        [:button {:id "view-toggle"
+                  :on-click #(dispatch! {:type :view/set-cycle})}
+         toggle-label]
+        [:button {:id "pause-btn"
+                  :on-click #(dispatch! {:type :pause/toggle})}
+         (if paused "Resume" "Pause")]
+        [:button {:id "clear-btn"
+                  :class "secondary"
+                  :on-click #(dispatch! {:type :data/clear})}
+         "Clear"]])]))
+
+(defn app-shell
+  "Parameters: app-state map, path string for the current location.
+   Returns: hiccup vector for the full application shell."
+  [app-state path]
+  (let [timeline-page? (= path "/timeline")
+        enforced-view (if timeline-page? :timeline (:view-mode app-state))
+        content-state (assoc app-state :view-mode enforced-view)]
+    [:div {:class "container"}
+     [:div {:class "header"}
+      [:h1 (if timeline-page?
+             "Prusa Telemetry Timeline"
+             "Prusa Telemetry Dashboard")]
+      (header-controls content-state timeline-page?)]
+     [:div {:class "content"}
+      (main-view content-state)]]))
