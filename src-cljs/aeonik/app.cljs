@@ -1,19 +1,35 @@
 (ns aeonik.app
-  (:require [aeonik.ws :as ws]
-            [aeonik.events :refer [dispatch! init-timeline!]]
-            [aeonik.render :refer [render!]]
-            [aeonik.state :refer [app-state load-state-from-storage!] :as state]))
+  (:require [aeonik.events :refer [dispatch! init-timeline!]]
+            [aeonik.state :refer [app-state load-state-from-storage!] :as state]
+            [aeonik.views :as views]
+            [aeonik.ws :as ws]
+            [reagent.dom :as rdom]))
 
-(defn set-view-mode [mode]
-  "Set the view mode (called from timeline.html)"
+(defn set-view-mode
+  "Parameters: mode keyword or string representing a view.
+   Returns: nil after dispatching the view selection."
+  [mode]
   (let [mode-keyword (if (string? mode) (keyword mode) mode)]
     (dispatch! {:type :view/set :mode mode-keyword})))
 
-(defn init []
-  (println "Initializing Prusa Telemetry Dashboard...")
-  ;; Load persisted state before initializing
-  (load-state-from-storage!)
-  ;; Ensure timeline selection is set up if we have data
+(defn- root-component
+  "Parameters: none.
+   Returns: hiccup vector for the mounted application root."
+  []
+  (let [state-val @app-state]
+    [views/app-shell state-val (.-pathname js/location)]))
+
+(defn- mount-root!
+  "Parameters: none.
+   Returns: nil after mounting the Reagent root."
+  []
+  (when-let [root-el (.getElementById js/document "app")]
+    (rdom/render [root-component] root-el)))
+
+(defn- ensure-timeline-selection!
+  "Parameters: none.
+   Returns: nil after ensuring timeline defaults are populated."
+  []
   (let [events (:telemetry-events @app-state)
         timeline-data (state/get-timeline-data events)
         filenames (keys timeline-data)]
@@ -27,46 +43,19 @@
             (when (nil? (:selected-time @app-state))
               (dispatch! {:type :timeline/set-time :time max-time}))
             (when (nil? (:selected-filename @app-state))
-              (dispatch! {:type :timeline/set-filename :filename current-filename})))))))
-  (init-timeline!) ; Initialize timeline with dispatch! callback
+              (dispatch! {:type :timeline/set-filename :filename current-filename}))))))))
+
+(defn init
+  "Parameters: none.
+   Returns: nil after bootstrapping the dashboard."
+  []
+  (println "Initializing Prusa Telemetry Dashboard...")
+  (load-state-from-storage!)
+  (ensure-timeline-selection!)
+  (init-timeline!)
   (ws/connect-websocket!)
-  
-  ;; Check if we're on the timeline page and set view mode after a short delay
-  (let [path (.-pathname js/location)]
-    (when (= path "/timeline")
-      (js/setTimeout (fn [] 
-                      (dispatch! {:type :view/set :mode :timeline})) 
-                    200)))
-  
-  ;; Set up controls
-  (when-let [pause-btn (.getElementById js/document "pause-btn")]
-    (set! (.-onclick pause-btn)
-          (fn [_]
-            (dispatch! {:type :pause/toggle})
-            ;; Update button text after state change
-            (js/setTimeout
-             (fn []
-               (set! (.-textContent pause-btn) 
-                     (if (:paused @app-state) "Resume" "Pause")))
-             0))))
-  
-  (when-let [clear-btn (.getElementById js/document "clear-btn")]
-    (set! (.-onclick clear-btn)
-          (fn [_]
-            (dispatch! {:type :data/clear}))))
-  
-  (when-let [view-toggle (.getElementById js/document "view-toggle")]
-    (set! (.-onclick view-toggle)
-          (fn [_]
-            (dispatch! {:type :view/set-cycle})
-            (set! (.-textContent view-toggle) 
-                  (case (:view-mode @app-state)
-                    :latest "Show Packets"
-                    :packets "Show Timeline"
-                    :timeline "Show Latest"
-                    "Show Packets")))))
-  
-  ;; Initial render
-  (render!))
+  (when (= (.-pathname js/location) "/timeline")
+    (dispatch! {:type :view/set :mode :timeline}))
+  (mount-root!))
 
 (set! (.-onload js/window) init)

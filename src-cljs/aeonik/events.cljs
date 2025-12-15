@@ -353,12 +353,8 @@
         state))
 
     :files/set-available
-    (let [files-vec (vec (:files ev)) ; Ensure it's a vector, not a lazy seq
-          new-state (assoc state :available-files files-vec)]
-      (println "Handling files/set-available, file count:" (count files-vec))
-      (println "Old available-files:" (:available-files state))
-      (println "New available-files:" (:available-files new-state))
-      new-state)
+    (let [files-vec (vec (:files ev))] ; Ensure it's a vector, not a lazy seq
+      (assoc state :available-files files-vec))
 
     :files/fetch-available
     state ; Side effect handled in files namespace

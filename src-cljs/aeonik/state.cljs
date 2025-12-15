@@ -1,9 +1,10 @@
-(ns aeonik.state)
+(ns aeonik.state
+  (:require [reagent.core :as r]))
 
 (def ^:private storage-key "prusa-telemetry-state")
 
 (defonce app-state
-  (atom
+  (r/atom
    {:ws                 nil
     :connected          false
     :telemetry-events   []      ; Single vector of all telemetry events (live + loaded), sorted by time
