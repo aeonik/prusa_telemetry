@@ -9,7 +9,8 @@
  
  :dependencies []
  
- :dev-http {9630 "resources"}
+ :dev-http {9630 {:root "resources"
+                  :proxy-url "http://localhost:8080"}}
  
  :builds
  {:app {:target :browser

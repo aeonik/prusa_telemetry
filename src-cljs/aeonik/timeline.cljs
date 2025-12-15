@@ -1,5 +1,5 @@
 (ns aeonik.timeline
-  (:require [aeonik.state :refer [app-state]]))
+  (:require [aeonik.state :refer [app-state] :as state]))
 
 (defonce timeline-loop (atom nil))
 (defonce current-time-range (atom nil))
@@ -34,10 +34,11 @@
 
 (defn update-loop! []
   "Check if we need to start/stop the loop based on state"
-  (let [state @app-state
-        playing (:timeline-playing state)
-        current-filename (:selected-filename state)
-        all-metrics (get (:timeline-data state) current-filename [])
+  (let [app-state-val @app-state
+        playing (:timeline-playing app-state-val)
+        current-filename (:selected-filename app-state-val)
+        timeline-data (state/get-timeline-data (:telemetry-events app-state-val))
+        all-metrics (get timeline-data current-filename [])
         time-range (if (seq all-metrics)
                     (let [metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
                       (when (seq metrics-with-time)
@@ -50,10 +51,10 @@
       (start-loop! 100 time-range) ; 100ms per step
       (stop-loop!))))
 
-;; Watch for timeline-playing and timeline-data changes to start/stop loop
+;; Watch for timeline-playing and telemetry-events changes to start/stop loop
 (add-watch app-state :timeline-loop
            (fn [_ _ old new]
              (when (or (not= (:timeline-playing old) (:timeline-playing new))
                       (not= (:selected-filename old) (:selected-filename new))
-                      (not= (:timeline-data old) (:timeline-data new)))
+                      (not= (:telemetry-events old) (:telemetry-events new)))
                (update-loop!))))

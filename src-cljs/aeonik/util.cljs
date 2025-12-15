@@ -40,14 +40,47 @@
       (str (pad-number minutes 2) ":" (pad-number secs-int 2) "." (pad-number secs-frac 3)))
     "--------"))
 
-(defn get-metrics-at-time [timeline-data filename time-us]
-  "Get the latest metric values at or before the given time"
+(defn parse-wall-time-str
+  "Parse wall-time string (HH:mm:ss.SSS) to milliseconds since midnight"
+  [time-str]
+  (when time-str
+    (try
+      (let [parts (.split time-str ":")
+            hours (js/parseInt (aget parts 0) 10)
+            minutes (js/parseInt (aget parts 1) 10)
+            seconds-str (aget parts 2)
+            seconds-parts (.split seconds-str (js/RegExp. "\\."))
+            seconds (js/parseInt (aget seconds-parts 0) 10)
+            millis (if (> (.-length seconds-parts) 1)
+                     (js/parseInt (aget seconds-parts 1) 10)
+                     0)]
+        (+ (* hours 3600000)
+           (* minutes 60000)
+           (* seconds 1000)
+           millis))
+      (catch :default e
+        (println "Error parsing wall-time:" time-str e)
+        nil))))
+
+(defn format-wall-time-ms
+  "Format milliseconds since midnight to HH:mm:ss.SSS"
+  [time-ms]
+  (when time-ms
+    (let [total-seconds (int (/ time-ms 1000))
+          hours (int (/ total-seconds 3600))
+          minutes (int (/ (mod total-seconds 3600) 60))
+          seconds (mod total-seconds 60)
+          millis (mod time-ms 1000)]
+      (str (pad-number hours 2) ":" (pad-number minutes 2) ":" (pad-number seconds 2) "." (pad-number millis 3)))))
+
+(defn get-metrics-at-time [timeline-data filename time-ms]
+  "Get the latest metric values at or before the given time (in milliseconds)"
   (let [all-metrics (get timeline-data filename [])
-        ;; Filter out metrics without device-time-us and those after the selected time
-        filtered (filter #(and (some? (:device-time-us %))
-                              (<= (:device-time-us %) time-us)) all-metrics)
+        ;; Filter out metrics without wall-time-ms and those after the selected time
+        filtered (filter #(and (some? (:wall-time-ms %))
+                              (<= (:wall-time-ms %) time-ms)) all-metrics)
         grouped (group-by (fn [m] (str (:sender m) "/" (:name m))) filtered)]
     (map (fn [[_key metrics]]
-           (let [latest (last (sort-by :device-time-us metrics))]
+           (let [latest (last (sort-by :wall-time-ms metrics))]
              latest))
          grouped)))

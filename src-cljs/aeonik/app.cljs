@@ -2,7 +2,7 @@
   (:require [aeonik.ws :as ws]
             [aeonik.events :refer [dispatch! init-timeline!]]
             [aeonik.render :refer [render!]]
-            [aeonik.state :refer [app-state]]))
+            [aeonik.state :refer [app-state load-state-from-storage!] :as state]))
 
 (defn set-view-mode [mode]
   "Set the view mode (called from timeline.html)"
@@ -11,6 +11,23 @@
 
 (defn init []
   (println "Initializing Prusa Telemetry Dashboard...")
+  ;; Load persisted state before initializing
+  (load-state-from-storage!)
+  ;; Ensure timeline selection is set up if we have data
+  (let [events (:telemetry-events @app-state)
+        timeline-data (state/get-timeline-data events)
+        filenames (keys timeline-data)]
+    (when (seq filenames)
+      (let [current-filename (or (:selected-filename @app-state) (first filenames))
+            all-metrics (get timeline-data current-filename [])
+            metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
+        (when (seq metrics-with-time)
+          (let [times (map :wall-time-ms metrics-with-time)
+                max-time (apply max times)]
+            (when (nil? (:selected-time @app-state))
+              (dispatch! {:type :timeline/set-time :time max-time}))
+            (when (nil? (:selected-filename @app-state))
+              (dispatch! {:type :timeline/set-filename :filename current-filename})))))))
   (init-timeline!) ; Initialize timeline with dispatch! callback
   (ws/connect-websocket!)
   

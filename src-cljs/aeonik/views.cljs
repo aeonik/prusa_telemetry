@@ -1,14 +1,18 @@
 (ns aeonik.views
   (:require [aeonik.util :as u]
-            [aeonik.events :refer [dispatch!]]))
+            [aeonik.events :refer [dispatch!]]
+            [aeonik.state :as state]
+            [aeonik.files :as files]
+            [clojure.string :as str]))
 
-(defn status-view [state]
-  (if (:connected state)
+(defn status-view [app-state]
+  (if (:connected app-state)
     [:span {:class "connected"} "● Connected"]
     [:span {:class "disconnected"} "● Disconnected"]))
 
-(defn latest-view [state]
-  (let [values (vals (:latest-values state))
+(defn latest-view [app-state]
+  (let [latest-values (state/get-latest-values (:telemetry-events app-state))
+        values (vals latest-values)
         sorted-values (sort-by (fn [v] (str (:sender v) "/" (:name v))) values)]
     (if (empty? sorted-values)
       [:div {:class "empty"} "Waiting for telemetry data..."]
@@ -30,8 +34,10 @@
                 [:td (or (:device-time-str metric) "--------")]])
              sorted-values)]])))
 
-(defn packets-view [state]
-  (let [packets (:telemetry-data state)]
+(def ^:private packet-history-limit 50)
+
+(defn packets-view [app-state]
+  (let [packets (state/get-telemetry-packets (:telemetry-events app-state) packet-history-limit)]
     (if (empty? packets)
       [:div {:class "empty"} "Waiting for telemetry data..."]
       (map (fn [packet]
@@ -71,17 +77,6 @@
               max-time (apply max times)]
           {:min min-time :max max-time})))))
 
-(defn- timeline-filename-selector [filenames current-filename]
-  [:div {:class "filename-selector"}
-   [:label {:for "filename-select"} "Print File: "]
-   [:select {:id "filename-select"
-             :value current-filename
-             :onchange (fn [e]
-                        (dispatch! {:type :timeline/set-filename
-                                   :filename (aget e "target" "value")}))}
-    (map (fn [fname]
-           [:option {:value fname} fname])
-         filenames)]])
 
 (defn- timeline-time-range-display [time-range]
   [:div {:class "time-range-display"}
@@ -90,7 +85,7 @@
    [:span " → "]
    [:span {:class "time-max"} (u/format-wall-time-ms (:max time-range))]])
 
-(defn- timeline-slider [time-range current-time slider-dragging?]
+(defn- timeline-slider [time-range current-time _slider-dragging?]
   [:input {:type "range"
            :id "time-slider"
            :class "time-slider"
@@ -191,25 +186,91 @@
               [:td (or (:device-time-str metric) "--------")]])
            sorted-metrics)]]))
 
-(defn timeline-view [state]
-  (let [filenames (keys (:timeline-data state))
-        current-filename (or (:selected-filename state) (first filenames))
-        all-metrics (get (:timeline-data state) current-filename [])
+(defn- format-file-option-label [file-info]
+  "Format file info for display in dropdown"
+  (str (:date file-info) " - " (:filename file-info) " (" (.toFixed (/ (:size file-info) 1024) 1) " KB)"))
+
+(defn timeline-filename-selector [filenames current-filename available-files]
+  (let [;; Fetch files on first render if not already loaded
+        _ (when (empty? available-files)
+            (files/fetch-available-files!))
+        _ (println "timeline-filename-selector - available-files:" available-files "count:" (count available-files) "type:" (type available-files))
+        _ (println "timeline-filename-selector - filenames:" filenames "count:" (count filenames))
+        ;; Create a map of filename -> file-info for quick lookup
+        filename-to-file-info (reduce (fn [acc file-info]
+                                       (assoc acc (:filename file-info) file-info))
+                                     {}
+                                     available-files)
+        loaded-options (map (fn [fname]
+                             [:option {:value fname} fname])
+                           filenames)
+        available-options (map (fn [file-info]
+                                (println "Creating option for file-info:" file-info)
+                                [:option {:value (str "file:" (:filename file-info))}
+                                 (format-file-option-label file-info)])
+                              available-files)
+        options (concat
+                 ;; Empty option
+                 [[:option {:value ""} "-- Select a file --"]]
+                 ;; First show loaded filenames
+                 loaded-options
+                 ;; Then show available files with formatted labels
+                 available-options)
+        _ (println "timeline-filename-selector - loaded-options count:" (count loaded-options))
+        _ (println "timeline-filename-selector - available-options count:" (count available-options))
+        _ (println "timeline-filename-selector - total options count:" (count options))]
+    [:div {:class "filename-selector"}
+     [:label {:for "filename-select"} "Print File: "]
+     [:select {:id "filename-select"
+               :value (or current-filename "")
+               :onmousedown (fn [_]
+                             (dispatch! {:type :dropdown/interact-start}))
+               :onblur (fn [_]
+                        (dispatch! {:type :dropdown/interact-end}))
+               :onchange (fn [e]
+                          (let [selected-value (aget e "target" "value")]
+                            (println "Selected value:" selected-value)
+                            ;; Use setTimeout to clear flag after change completes
+                            ;; This ensures the dropdown can finish its interaction
+                            (js/setTimeout
+                             (fn []
+                               (dispatch! {:type :dropdown/interact-end}))
+                             100)
+                            ;; Check if this is an available file that needs to be loaded
+                            (if (str/starts-with? selected-value "file:")
+                              (let [actual-filename (subs selected-value 5) ; Remove "file:" prefix
+                                    file-info (get filename-to-file-info actual-filename)]
+                                (println "Loading file:" actual-filename "file-info:" file-info)
+                                (when file-info
+                                  ;; File is not loaded yet, load it
+                                  (files/load-telemetry-file (:date file-info) actual-filename)))
+                              ;; For already loaded files, just set the filename
+                              (when (not= selected-value "")
+                                (dispatch! {:type :timeline/set-filename
+                                           :filename selected-value})))))}
+      options]]))
+
+(defn timeline-view [app-state]
+  (let [timeline-data (state/get-timeline-data (:telemetry-events app-state))
+        filenames (keys timeline-data)
+        current-filename (or (:selected-filename app-state) (first filenames))
+        available-files (:available-files app-state)
+        all-metrics (get timeline-data current-filename [])
         time-range (compute-time-range all-metrics)
-        current-time (or (:selected-time state) (when time-range (:max time-range)))
+        current-time (or (:selected-time app-state) (when time-range (:max time-range)))
         metrics-at-time (if (and current-filename current-time)
-                         (u/get-metrics-at-time (:timeline-data state) current-filename current-time)
+                         (u/get-metrics-at-time timeline-data current-filename current-time)
                          [])
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
     [:div {:class "timeline-view"}
      [:div {:class "timeline-controls"}
-      (timeline-filename-selector filenames current-filename)
-      (timeline-scrubber time-range current-time (:timeline-playing state) (:slider-dragging state))]
+      (timeline-filename-selector filenames current-filename available-files)
+      (timeline-scrubber time-range current-time (:timeline-playing app-state) (:slider-dragging app-state))]
      (timeline-metrics-table sorted-metrics)]))
 
-(defn main-view [state]
-  (case (:view-mode state)
-    :latest  (latest-view state)
-    :packets (packets-view state)
-    :timeline (timeline-view state)
-    (latest-view state)))
+(defn main-view [app-state]
+  (case (:view-mode app-state)
+    :latest  (latest-view app-state)
+    :packets (packets-view app-state)
+    :timeline (timeline-view app-state)
+    (latest-view app-state)))

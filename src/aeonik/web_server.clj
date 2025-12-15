@@ -6,27 +6,132 @@
    [manifold.deferred :as d]
    [aeonik.prusa-telemetry :as telemetry]
    [clojure.data.json :as json]
+   [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]))
 
+(def ^:private prints-dir (io/file "telemetry-data" "prints"))
+
+;; Track active prints per sender: {sender {:filename "..." :last-packet-time <timestamp>}}
+(def ^:private active-prints (atom {}))
+
+;; Print is considered ended if no packets received for this many milliseconds
+(def ^:private print-end-timeout-ms (* 10 60 1000)) ; 10 minutes
+
+(defn- ensure-prints-dir! 
+  "Ensure the prints directory exists"
+  []
+  (when-not (.exists prints-dir)
+    (.mkdirs prints-dir)
+    (println "Created prints directory:" (.getAbsolutePath prints-dir))))
+
+(defn- sanitize-filename 
+  "Sanitize filename for use in file system"
+  [filename]
+  (-> filename
+      (str/replace #"[^\w\s\-_\.]" "_")
+      (str/replace #"\s+" "_")
+      (str/trim)))
+
+(defn- get-print-filename 
+  "Extract print_filename from metrics"
+  [metrics]
+  (some (fn [m]
+          (when (= (:name m) "print_filename")
+            (or (:value m)
+                (when-let [fields (:fields m)]
+                  (if (map? fields)
+                    (or (get fields "value")
+                        (first (vals fields)))
+                    nil)))))
+        metrics))
+
+(defn- get-active-print-filename 
+  "Get the active print filename for a sender, checking for timeouts"
+  [sender current-time]
+  (let [active-print (get @active-prints sender)]
+    (if active-print
+      (let [time-since-last-packet (- current-time (:last-packet-time active-print))]
+        (if (> time-since-last-packet print-end-timeout-ms)
+          ;; Print has timed out - consider it ended
+          (do
+            (swap! active-prints dissoc sender)
+            nil)
+          ;; Still active - update last packet time
+          (do
+            (swap! active-prints assoc sender (assoc active-print :last-packet-time current-time))
+            (:filename active-print))))
+      nil)))
+
+(defn- set-active-print-filename! 
+  "Set the active print filename for a sender"
+  [sender filename current-time]
+  (swap! active-prints assoc sender {:filename filename :last-packet-time current-time}))
+
+(defn- save-packet-to-file!
+  "Save a packet to a file for the given print filename in EDN format (append-only, one packet per line)"
+  [packet print-filename]
+  (try
+    (ensure-prints-dir!)
+    (let [sanitized-name (sanitize-filename print-filename)
+          now (java.util.Date.)
+          date-fmt (java.text.SimpleDateFormat. "yyyy-MM-dd")
+          date-str (.format date-fmt now)
+          date-dir (io/file prints-dir date-str)
+          _ (.mkdirs date-dir)
+          print-file (io/file date-dir (str sanitized-name ".edn"))]
+      (with-open [writer (io/writer print-file :append true)]
+        (binding [*print-length* nil
+                  *print-level* nil
+                  *out* writer]
+          (prn packet)))
+      true)
+    (catch Exception e
+      (println "Error saving packet to file:" (.getMessage e))
+      (.printStackTrace e)
+      false)))
+
 (defn telemetry-to-json
-  "Convert telemetry packet to JSON-serializable format"
+  "Convert telemetry packet to JSON-serializable format, ensuring metrics are sorted by device-time-us"
   [{:keys [sender received-at prelude metrics display-lines wall-time-str]}]
-  {:sender (str sender)
-   :received-at (.getTime received-at)
-   :prelude prelude
-   :metrics (map (fn [m]
-                   (cond-> {:name (:name m)
-                            :type (name (:type m))
-                            :tick (:tick m)
-                            :device-time-us (:device-time-us m)
-                            :device-time-str (:device-time-str m)}
-                     (:value m) (assoc :value (:value m))
-                     (:error m) (assoc :error (:error m))
-                     (:fields m) (assoc :fields (:fields m))))
-                 metrics)
-   :display-lines display-lines
-   :wall-time-str wall-time-str})
+  (let [sorted-metrics (sort-by (fn [m] (or (:device-time-us m) 0)) metrics)]
+    {:sender (str sender)
+     :received-at (.getTime received-at)
+     :prelude prelude
+     :metrics (map (fn [m]
+                     (cond-> {:name (:name m)
+                              :type (name (:type m))
+                              :tick (:tick m)
+                              :device-time-us (:device-time-us m)
+                              :device-time-str (:device-time-str m)}
+                       (:value m) (assoc :value (:value m))
+                       (:error m) (assoc :error (:error m))
+                       (:fields m) (assoc :fields (:fields m))))
+                   sorted-metrics)
+     :display-lines display-lines
+     :wall-time-str wall-time-str}))
+
+(defn- handle-packet-saving! 
+  "Handle print filename tracking and file saving (called once per packet, not per WebSocket client)"
+  [packet]
+  (let [{:keys [sender metrics]} packet
+        sender-str (str sender)
+        current-time (System/currentTimeMillis)
+        ;; Check for new print_filename in this packet
+        new-print-filename (get-print-filename metrics)
+        ;; Get active print filename (handles sticky behavior and timeout)
+        active-print-filename (get-active-print-filename sender-str current-time)]
+    ;; If we see a new print_filename, update the active print
+    (when new-print-filename
+      (if (= new-print-filename active-print-filename)
+        ;; Same print - just update timestamp (already done in get-active-print-filename)
+        nil
+        ;; New print started - update active print
+        (set-active-print-filename! sender-str new-print-filename current-time)))
+    ;; Save packet if we have an active print (either from this packet or sticky from previous)
+    (let [print-filename-to-use (or new-print-filename active-print-filename)]
+      (when print-filename-to-use
+        (save-packet-to-file! (telemetry-to-json packet) print-filename-to-use)))))
 
 (defn websocket-handler
   "WebSocket handler that streams telemetry data"
@@ -110,6 +215,75 @@
        :headers {"Content-Type" "text/plain"}
        :body (str "File not found: " relative-path)})))
 
+(defn list-telemetry-files-handler
+  "List all available telemetry data files"
+  [_req]
+  (try
+    (ensure-prints-dir!)
+    (let [date-dirs (filter #(and (.isDirectory %) 
+                                  (re-matches #"\d{4}-\d{2}-\d{2}" (.getName %)))
+                           (.listFiles prints-dir))
+          files-by-date (reduce (fn [acc date-dir]
+                                 (let [date (.getName date-dir)
+                                       edn-files (filter #(and (.isFile %)
+                                                               (str/ends-with? (.getName %) ".edn"))
+                                                        (.listFiles date-dir))
+                                       file-info (map (fn [f]
+                                                       {:date date
+                                                        :filename (.getName f)
+                                                        :size (.length f)
+                                                        :modified (.lastModified f)})
+                                                     edn-files)]
+                                   (concat acc file-info)))
+                               []
+                               date-dirs)
+          sorted-files (sort-by (fn [f] [(:date f) (:filename f)]) files-by-date)]
+      {:status 200
+       :headers {"Content-Type" "application/json"}
+       :body (json/write-str sorted-files)})
+    (catch Exception e
+      (println "Error listing telemetry files:" (.getMessage e))
+      (.printStackTrace e)
+      {:status 500
+       :headers {"Content-Type" "application/json"}
+       :body (json/write-str {:error (.getMessage e)})})))
+
+(defn load-telemetry-file-handler
+  "Load a telemetry data file by date and filename"
+  [req]
+  (try
+    (let [uri (:uri req)
+          ;; Extract date and filename from URI like /api/telemetry-file/2025-12-12/filename.edn
+          match (re-matches #"/api/telemetry-file/([^/]+)/(.+)" uri)]
+      (if match
+        (let [[_ date filename] match
+              file-path (io/file prints-dir date filename)]
+          (if (and (.exists file-path) (.isFile file-path))
+            (let [packets (with-open [reader (io/reader file-path)]
+                           (doall (map (fn [line]
+                                        (try
+                                          (edn/read-string line)
+                                          (catch Exception e
+                                            (println "Error reading line:" line (.getMessage e))
+                                            nil)))
+                                      (line-seq reader))))
+                  valid-packets (filter some? packets)]
+              {:status 200
+               :headers {"Content-Type" "application/json"}
+               :body (json/write-str valid-packets)})
+            {:status 404
+             :headers {"Content-Type" "application/json"}
+             :body (json/write-str {:error "File not found"})}))
+        {:status 400
+         :headers {"Content-Type" "application/json"}
+         :body (json/write-str {:error "Invalid request format"})}))
+    (catch Exception e
+      (println "Error loading telemetry file:" (.getMessage e))
+      (.printStackTrace e)
+      {:status 500
+       :headers {"Content-Type" "application/json"}
+       :body (json/write-str {:error (.getMessage e)})})))
+
 (defn start-web-server
   "Start HTTP server with WebSocket support for telemetry streaming.
    
@@ -125,6 +299,26 @@
   (when (nil? telemetry-stream)
     (throw (ex-info "telemetry-stream is required" {})))
   
+  ;; Set up a single consumer for saving packets (runs once per packet, not per WebSocket client)
+  ;; Store the consumer deferred so we can track errors
+  (let [saving-consumer (s/consume 
+                         (fn [packet]
+                           (try
+                             (handle-packet-saving! packet)
+                             (catch Exception e
+                               (println "ERROR processing packet for saving:" (.getMessage e))
+                               (.printStackTrace e)))
+                           ;; Always return true to keep consuming
+                           true)
+                         telemetry-stream)]
+    ;; Handle errors in the consumer (log but don't crash)
+    (d/on-realized saving-consumer
+                   (fn [_] (println "Packet saving consumer closed"))
+                   (fn [error]
+                     (println "ERROR: Packet saving consumer failed:" (.getMessage error))
+                     (.printStackTrace error)))
+    (println "Packet saving consumer initialized"))
+  
   (let [timeline-handler (fn [_req]
                           (if-let [resource (io/resource "timeline.html")]
                             {:status 200
@@ -136,6 +330,7 @@
         routes {"/" index-handler
                 "/timeline" timeline-handler
                 "/ws" (websocket-handler telemetry-stream)
+                "/api/telemetry-files" list-telemetry-files-handler
                 "/app.js" (fn [_req]
                             (let [app-js-file (io/file "resources/app.js")]
                               (if (and (.exists app-js-file) (.isFile app-js-file))
@@ -155,20 +350,35 @@
         
         handler (fn [req]
                   (try
-                    (println "Request received:" (:uri req) "Method:" (:request-method req))
-                    (cond
-                      ;; Check exact routes first
-                      (contains? routes (:uri req))
-                      ((get routes (:uri req)) req)
-                      
-                      ;; Then check for ClojureScript assets under /app.js/
-                      (str/starts-with? (:uri req) "/app.js/")
-                      (cljs-asset-handler req)
-                      
-                      :else
-                      {:status 404
-                       :headers {"Content-Type" "text/plain"}
-                       :body "Not found"})
+                    (let [uri (:uri req)]
+                      (println "Request received:" uri "Method:" (:request-method req))
+                      (println "Available routes:" (keys routes))
+                      (println "Route match check:" (contains? routes uri))
+                      (cond
+                        ;; Check exact routes first
+                        (contains? routes uri)
+                        (do
+                          (println "Matched route:" uri)
+                          ((get routes uri) req))
+                        
+                        ;; Check for telemetry file loading endpoint
+                        (str/starts-with? uri "/api/telemetry-file/")
+                        (do
+                          (println "Matched telemetry-file pattern")
+                          (load-telemetry-file-handler req))
+                        
+                        ;; Then check for ClojureScript assets under /app.js/
+                        (str/starts-with? uri "/app.js/")
+                        (do
+                          (println "Matched app.js pattern")
+                          (cljs-asset-handler req))
+                        
+                        :else
+                        (do
+                          (println "No route matched for:" uri)
+                          {:status 404
+                           :headers {"Content-Type" "text/plain"}
+                           :body (str "Not found. URI: " uri)})))
                     (catch Exception e
                       (println "Handler error:" (.getMessage e))
                       (.printStackTrace e)

@@ -1,7 +1,9 @@
 (ns aeonik.render
-  (:require [aeonik.state :refer [app-state]]
+  (:require [aeonik.state :refer [app-state] :as state]
             [aeonik.views :as views]
             [aeonik.util :as u]))
+
+(def ^:private debug? false) ; Set to true to enable debug logging
 
 (defonce render-state
   (atom {:render-scheduled? false
@@ -34,6 +36,8 @@
           (= k :oninput) (set! (.-oninput elem) v)
           (= k :onmousedown) (set! (.-onmousedown elem) v)
           (= k :onmouseup) (set! (.-onmouseup elem) v)
+          (= k :onfocus) (set! (.-onfocus elem) v)
+          (= k :onblur) (set! (.-onblur elem) v)
           (= k :ontouchstart) (set! (.-ontouchstart elem) v)
           (= k :ontouchend) (set! (.-ontouchend elem) v)
           (= k :value) (set! (.-value elem) v)
@@ -130,10 +134,11 @@
 (defn update-timeline-display-only! [& [override-time]]
   "Update only timeline display elements without full DOM replacement.
    If override-time is provided, use it instead of reading from state."
-  (let [state @app-state
-        filenames (keys (:timeline-data state))
-        current-filename (or (:selected-filename state) (first filenames))
-        all-metrics (get (:timeline-data state) current-filename [])
+  (let [app-state-val @app-state
+        timeline-data (state/get-timeline-data (:telemetry-events app-state-val))
+        filenames (keys timeline-data)
+        current-filename (or (:selected-filename app-state-val) (first filenames))
+        all-metrics (get timeline-data current-filename [])
         time-range (if (seq all-metrics)
                     (let [metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
                       (when (seq metrics-with-time)
@@ -142,9 +147,9 @@
                               max-time (apply max times)]
                           {:min min-time :max max-time})))
                     nil)
-        current-time (or override-time (:selected-time state))
+        current-time (or override-time (:selected-time app-state-val))
         metrics-at-time (if (and current-filename current-time)
-                         (u/get-metrics-at-time (:timeline-data state) current-filename current-time)
+                         (u/get-metrics-at-time timeline-data current-filename current-time)
                          [])
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
     ;; Update slider value
@@ -166,6 +171,7 @@
 (defn render! []
   (try
     (let [state @app-state
+          _ (when debug? (println "render! called, available-files count:" (count (:available-files state))))
           status-el (.getElementById js/document "status")
           content-el (.getElementById js/document "content")]
       ;; Don't do full render if user is dragging slider in timeline view
@@ -175,9 +181,10 @@
           (when status-el
             (replace-children! status-el (views/status-view state)))
           (when content-el
-            (let [filenames (keys (:timeline-data state))
+            (let [timeline-data (state/get-timeline-data (:telemetry-events state))
+                  filenames (keys timeline-data)
                   current-filename (or (:selected-filename state) (first filenames))
-                  all-metrics (get (:timeline-data state) current-filename [])
+                  all-metrics (get timeline-data current-filename [])
                   time-range (if (seq all-metrics)
                               (let [metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
                                 (when (seq metrics-with-time)
@@ -194,7 +201,7 @@
                 ;; Timeline view with existing table - update tbody and slider only (if slider exists)
                 (let [current-time (or (:selected-time state) (when time-range (:max time-range)))
                       metrics-at-time (if (and current-filename current-time)
-                                       (u/get-metrics-at-time (:timeline-data state) current-filename current-time)
+                                       (u/get-metrics-at-time timeline-data current-filename current-time)
                                        [])
                       sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
                   ;; Update only the table tbody, preserve rest of DOM
@@ -225,19 +232,41 @@
 
 (defn schedule-render! []
   (let [{:keys [render-scheduled? last-render-ms throttle-ms]} @render-state
-        now (js/Date.now)]
-    (when (and (not render-scheduled?)
-               (>= (- now last-render-ms) throttle-ms))
-      (swap! render-state assoc :render-scheduled? true)
-      (js/requestAnimationFrame render!))))
+        now (js/Date.now)
+        time-since-last (- now last-render-ms)]
+    (when debug?
+      (println "schedule-render! called - render-scheduled?:" render-scheduled? "time-since-last:" time-since-last "throttle-ms:" throttle-ms))
+    (cond
+      render-scheduled?
+      (when debug? (println "Render already scheduled, skipping"))
+      
+      (< time-since-last throttle-ms)
+      (when debug? (println "Throttling render, time since last:" time-since-last "ms"))
+      
+      :else
+      (do
+        (when debug? (println "Scheduling render via requestAnimationFrame"))
+        (swap! render-state assoc :render-scheduled? true)
+        (js/requestAnimationFrame render!)))))
 
 ;; Expose update-timeline-display-only! globally so views can call it
 (set! (.-updateTimelineDisplay js/window) update-timeline-display-only!)
 
 ;; Watch app-state for changes and schedule renders
-;; Skip render scheduling when slider is being dragged (it updates DOM directly)
+;; Skip render scheduling when slider is being dragged or dropdown is being interacted with
 (add-watch app-state :render-watcher
            (fn [_ _ old new]
-             (when (and (not= old new)
-                       (not (:slider-dragging new)))
-               (schedule-render!))))
+             (let [available-files-changed? (not= (:available-files old) (:available-files new))]
+               (when (and (not= old new)
+                         (not (:slider-dragging new))
+                         (not (:dropdown-interacting new)))
+                 (when available-files-changed?
+                   (when debug? (println "available-files changed, forcing immediate render"))
+                   ;; Force immediate render for available-files changes (don't throttle)
+                   (swap! render-state assoc :render-scheduled? false :last-render-ms 0)
+                   (schedule-render!))
+                 (when-not available-files-changed?
+                   (schedule-render!))))))
+
+;; Expose schedule-render! globally so other components can trigger renders
+(set! (.-scheduleRender js/window) schedule-render!)
