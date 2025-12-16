@@ -262,14 +262,57 @@
       (println "Error clearing stored state:" e)
       false)))
 
-(defn state-summary []
-  (let [s @app-state]
-    {:telemetry-event   (first (:telemetry-events s))
-     :available-file    (first (:available-files s))
-     :view-mode         (:view-mode s)
-     :selected-packet-msg (:selected-packet-msg s)
-     :selected-filename (:selected-filename s)
-     :timeline-playing  (:timeline-playing s)}))
+(defn pick
+  "Select one item from coll.
+   selector can be:
+   - nil                => first
+   - keyword            => first item where (truthy? (get item selector))
+   - map                => first item where all kv pairs match (=)
+   - fn (predicate)     => first item where (selector item) is truthy
+   - number             => nth (safe-ish; nil if out of range)"
+  ([coll] (first coll))
+  ([coll selector]
+   (cond
+     (nil? selector)
+     (first coll)
+
+     (number? selector)
+     (nth coll selector nil)
+
+     (keyword? selector)
+     (some #(when (get % selector) %) coll)
+
+     (map? selector)
+     (some (fn [x]
+             (when (every? (fn [[k v]] (= (get x k) v)) selector)
+               x))
+           coll)
+
+     (fn? selector)
+     (some #(when (selector %) %) coll)
+
+     :else
+     (first coll))))
+
+(defn state-summary
+  "Return a small, printable view of app-state.
+   opts can include selectors for vector fields:
+   {:telemetry-event <selector>
+    :available-file  <selector>}"
+  ([] (state-summary {}))
+  ([{:keys [telemetry-event available-file]
+     :or   {telemetry-event nil
+            available-file  nil}}]
+   (let [s @app-state]
+     {:telemetry-event      (pick (:telemetry-events s) telemetry-event)
+      :available-file       (pick (:available-files s) available-file)
+      :view-mode            (:view-mode s)
+      :selected-packet-msg  (:selected-packet-msg s)
+      :selected-filename    (:selected-filename s)
+      :timeline-playing     (:timeline-playing s)})))
 
 (comment
-  (state-summary))
+  (state-summary)
+
+  (state-summary
+   {:telemetry-event #(= 1007147 (:packet-msg %))}))
