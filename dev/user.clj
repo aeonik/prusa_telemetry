@@ -106,6 +106,14 @@
   []
   (when (not @shadow-server-started)
     (println "Starting shadow-cljs server...")
+    ;; Check if we're in an existing nREPL session
+    (try
+      (require 'nrepl.server)
+      (when-let [existing-server (try (resolve 'nrepl.server/*server*) 
+                                      (catch Exception _ nil))]
+        (when (deref existing-server)
+          (println "  Detected existing nREPL session - shadow-cljs will use it")))
+      (catch Exception _))
     ;; Shadow-cljs will auto-detect existing nREPL session when started
     ;; from within CIDER's REPL and inject its middleware instead of
     ;; starting its own server
@@ -148,7 +156,7 @@
   ;; Start shadow-cljs synchronously to ensure it's ready when CIDER connects
   ;; Shadow-cljs will detect CIDER's nREPL and inject middleware instead of starting its own server
   (future
-    (Thread/sleep 1000) ; Brief delay to let CIDER's nREPL fully initialize
+    (Thread/sleep 5000) ; Brief delay to let CIDER's nREPL fully initialize
     (try
       (println "Auto-starting shadow-cljs for ClojureScript REPL...")
       (start-shadow!)

@@ -8,7 +8,10 @@
 ;; - REPL connects automatically when browser loads the page
 {:source-paths ["src-cljs"]
 
- :dependencies [[reagent "1.2.0"]]
+ :dependencies [[reagent "1.2.0"]
+                [org.slf4j/slf4j-nop "2.0.9"]]
+
+ :nrepl {:enabled true}
 
  :dev-http {9630 {:root "resources"
                   :proxy-url "http://localhost:8080"}}
