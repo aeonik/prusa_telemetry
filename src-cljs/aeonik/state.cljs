@@ -28,11 +28,11 @@
                  ;; Group events by packet-msg, then sort packets by msg number
                  (let [packets-by-msg (group-by :packet-msg events)
                        sorted-packets (->> packets-by-msg
-                                          (map (fn [[msg packet-events]]
-                                                 {:packet-msg msg
-                                                  :received-at (some :received-at packet-events)
-                                                  :events (sort-by :device-time-us packet-events)}))
-                                          (sort-by :packet-msg))]
+                                           (map (fn [[msg packet-events]]
+                                                  {:packet-msg msg
+                                                   :received-at (some :received-at packet-events)
+                                                   :events (sort-by :device-time-us packet-events)}))
+                                           (sort-by :packet-msg))]
                    (assoc acc filename sorted-packets)))
                {}
                grouped-by-filename)))
@@ -55,11 +55,11 @@
   [events]
   (let [grouped (group-by (fn [e] (str (:sender e) "/" (:name e))) events)
         latest-map (reduce-kv (fn [acc k events]
-                                 (let [sorted (sort-by (fn [e] (or (:device-time-us e) 0)) events)
-                                       latest (last sorted)]
-                                   (assoc acc k latest)))
-                               {}
-                               grouped)]
+                                (let [sorted (sort-by (fn [e] (or (:device-time-us e) 0)) events)
+                                      latest (last sorted)]
+                                  (assoc acc k latest)))
+                              {}
+                              grouped)]
     latest-map))
 
 (defn get-timeline-data
@@ -80,15 +80,15 @@
                          {:sender (:sender first-event)
                           :wall-time-str (:wall-time-str first-event)
                           :metrics (map (fn [e]
-                                         {:name (:name e)
-                                          :value (:value e)
-                                          :fields (:fields e)
-                                          :error (:error e)
-                                          :type (:type e)
-                                          :tick (:tick e)
-                                          :device-time-us (:device-time-us e)
-                                          :device-time-str (:device-time-str e)})
-                                       packet-events)}))
+                                          {:name (:name e)
+                                           :value (:value e)
+                                           :fields (:fields e)
+                                           :error (:error e)
+                                           :type (:type e)
+                                           :tick (:tick e)
+                                           :device-time-us (:device-time-us e)
+                                           :device-time-str (:device-time-str e)})
+                                        packet-events)}))
                      grouped-by-packet)]
     (vec (take-last limit packets))))
 
@@ -127,8 +127,8 @@
             current @app-state
             ;; Ensure view-mode is a keyword if present
             parsed (if (contains? parsed :view-mode)
-                    (update parsed :view-mode #(if (string? %) (keyword %) %))
-                    parsed)
+                     (update parsed :view-mode #(if (string? %) (keyword %) %))
+                     parsed)
             ;; Merge: parsed UI preferences override current defaults
             ;; but preserve non-persisted fields (like telemetry-events) from current
             merged-state (merge current parsed)]
@@ -189,43 +189,43 @@
       "{}"
       (let [entries (seq value)
             entries-str (map (fn [[k v]]
-                              (str (indent (inc level))
-                                   (pretty-print-value k (inc level))
-                                   " "
-                                   (pretty-print-value v (inc level))))
-                            entries)]
+                               (str (indent (inc level))
+                                    (pretty-print-value k (inc level))
+                                    " "
+                                    (pretty-print-value v (inc level))))
+                             entries)]
         (str "{\n"
              (apply str (interpose ",\n" entries-str))
              "\n" (indent level) "}")))
-    
+
     (vector? value)
     (if (empty? value)
       "[]"
       (let [items-str (map (fn [item]
-                            (str (indent (inc level))
-                                 (pretty-print-value item (inc level))))
-                          value)]
+                             (str (indent (inc level))
+                                  (pretty-print-value item (inc level))))
+                           value)]
         (str "[\n"
              (apply str (interpose ",\n" items-str))
              "\n" (indent level) "]")))
-    
+
     (seq? value)
     (if (empty? value)
       "()"
       (let [items-str (map (fn [item]
-                            (str (indent (inc level))
-                                 (pretty-print-value item (inc level))))
-                          value)]
+                             (str (indent (inc level))
+                                  (pretty-print-value item (inc level))))
+                           value)]
         (str "(\n"
              (apply str (interpose ",\n" items-str))
              "\n" (indent level) ")")))
-    
+
     (string? value)
     (pr-str value)
-    
+
     (nil? value)
     "nil"
-    
+
     :else
     (pr-str value)))
 
@@ -261,3 +261,15 @@
     (catch :default e
       (println "Error clearing stored state:" e)
       false)))
+
+(defn state-summary []
+  (let [s @app-state]
+    {:telemetry-event   (first (:telemetry-events s))
+     :available-file    (first (:available-files s))
+     :view-mode         (:view-mode s)
+     :selected-packet-msg (:selected-packet-msg s)
+     :selected-filename (:selected-filename s)
+     :timeline-playing  (:timeline-playing s)}))
+
+(comment
+  (state-summary))

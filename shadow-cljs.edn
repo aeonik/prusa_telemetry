@@ -1,29 +1,26 @@
-;; shadow-cljs configuration
-;; 
-;; Development setup:
-;; - Shadow-cljs serves HTML/JS from resources/ on port 9630
-;; - Proxies all non-static requests (including /ws and /api/*) to backend on port 8080
-;; - Access app via http://localhost:9630 for REPL support
-;; - Frontend uses relative URLs - no port detection needed
-;; - REPL connects automatically when browser loads the page
-{:source-paths ["src-cljs"]
+{:deps true
 
- :dependencies [[reagent "1.2.0"]
-                [org.slf4j/slf4j-nop "2.0.9"]]
-
- :nrepl {:enabled true}
-
- :dev-http {9630 {:root "resources"
-                  :proxy-url "http://localhost:8080"}}
+ ;; Serve frontend from shadow on 9630, but proxy backend endpoints to 8080
+ :dev-http
+ {9630 {:root      "resources"          ; so /dashboard works
+        :proxy-url "http://localhost:8080"}} ; /api/*, /ws, etc -> backend
 
  :builds
- {:app {:target :browser
-        :output-dir "resources/js"
-        :output-to "resources/js/main.js"
-        :asset-path "/js"
-        :modules {:main {:init-fn aeonik.app/init}}
-        :devtools {:preloads [shadow.cljs.devtools.client.browser]
-                   :reload-strategy :full
-                   :autoload true}
-        :compiler-options {:optimizations :none
-                           :source-map true}}}}
+ {:app
+  {:target :browser
+
+   ;; compiled output lives under resources/, served by dev-http above
+   :output-dir "resources/js"
+   :output-to  "resources/js/main.js"
+   :asset-path "/js"
+
+   :modules {:main {:init-fn aeonik.app/init}}
+
+   :devtools
+   {:preloads [shadow.cljs.devtools.client.browser]
+    :reload-strategy :full
+    :autoload true}
+
+   :compiler-options
+   {:optimizations :none
+    :source-map true}}}}
