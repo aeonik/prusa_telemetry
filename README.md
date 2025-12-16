@@ -100,8 +100,8 @@ For REPL-driven development with hot reloading - **it just works!**
 2. **Open the app in your browser**:
    - Open `http://localhost:9630` (or 9631) in your browser
    - This completes the REPL connection - the "waiting" message will disappear
-   - Shadow-cljs serves HTML/JS files from `resources/`
-   - The WebSocket automatically connects to the backend on port 8080
+   - Shadow-cljs serves HTML/JS files from `resources/` and proxies all requests to the backend
+   - WebSocket and API calls use relative URLs - shadow-cljs handles proxying automatically
 
 **Service Management in REPL**:
 ```clojure

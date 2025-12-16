@@ -22,15 +22,17 @@
                        :else (str fields)))
       (str metric-value))))
 
-(defn pad-number [n width]
+(defn pad-number
   "Pad a number with leading zeros"
+  [n width]
   (let [s (str n)]
     (if (< (count s) width)
       (str (apply str (repeat (- width (count s)) "0")) s)
       s)))
 
-(defn format-time [time-us]
+(defn format-time
   "Format time in microseconds to MM:SS.mmm"
+  [time-us]
   (if time-us
     (let [seconds (/ time-us 1000000.0)
           total-seconds (int seconds)
@@ -73,14 +75,57 @@
           millis (mod time-ms 1000)]
       (str (pad-number hours 2) ":" (pad-number minutes 2) ":" (pad-number seconds 2) "." (pad-number millis 3)))))
 
-(defn get-metrics-at-time [timeline-data filename time-ms]
-  "Get the latest metric values at or before the given time (in milliseconds)"
-  (let [all-metrics (get timeline-data filename [])
-        ;; Filter out metrics without wall-time-ms and those after the selected time
-        filtered (filter #(and (some? (:wall-time-ms %))
-                              (<= (:wall-time-ms %) time-ms)) all-metrics)
-        grouped (group-by (fn [m] (str (:sender m) "/" (:name m))) filtered)]
-    (map (fn [[_key metrics]]
-           (let [latest (last (sort-by :wall-time-ms metrics))]
-             latest))
-         grouped)))
+(defn device-time-us-to-ms
+  "Convert device-time-us (microseconds) to milliseconds for timeline operations"
+  [time-us]
+  (when time-us
+    (int (/ time-us 1000))))
+
+(defn format-device-time-us
+  "Format device-time-us (microseconds) to MM:SS.mmm for display.
+   This is the same as format-time but with a clearer name."
+  [time-us]
+  (format-time time-us))
+
+(defn calculate-wall-time-ms
+  "Calculate wall time (milliseconds) for a metric based on packet received-at and device-time progression.
+   Uses the first metric's device-time-us as baseline and calculates relative wall time."
+  [packet-received-at-ms first-device-time-us metric-device-time-us]
+  (when (and packet-received-at-ms first-device-time-us metric-device-time-us)
+    (let [device-time-delta-us (- metric-device-time-us first-device-time-us)
+          device-time-delta-ms (/ device-time-delta-us 1000.0)]
+      (+ packet-received-at-ms device-time-delta-ms))))
+
+(defn format-wall-time-from-ms
+  "Format milliseconds timestamp to HH:mm:ss.SSS"
+  [time-ms]
+  (when time-ms
+    (let [date (js/Date. time-ms)
+          hours (.getHours date)
+          minutes (.getMinutes date)
+          seconds (.getSeconds date)
+          millis (.getMilliseconds date)]
+      (str (pad-number hours 2) ":" (pad-number minutes 2) ":" (pad-number seconds 2) "." (pad-number millis 3)))))
+
+(defn get-metrics-at-packet
+  "Get all metrics from a specific packet by packet-msg number.
+   Returns metrics with calculated wall-time added."
+  [timeline-data filename packet-msg]
+  (let [packets (get timeline-data filename [])
+        packet (first (filter #(= (:packet-msg %) packet-msg) packets))]
+    (if packet
+      (let [events (:events packet)
+            received-at (:received-at packet)
+            ;; Handle received-at: could be Date object, milliseconds number, or nil
+            received-at-ms (cond
+                            (number? received-at) received-at
+                            (instance? js/Date received-at) (.getTime received-at)
+                            :else nil)
+            first-device-time-us (some :device-time-us events)]
+        (map (fn [event]
+               (assoc event
+                      :calculated-wall-time-ms (calculate-wall-time-ms received-at-ms first-device-time-us (:device-time-us event))
+                      :calculated-wall-time-str (when-let [wt (calculate-wall-time-ms received-at-ms first-device-time-us (:device-time-us event))]
+                                                  (format-wall-time-from-ms wt))))
+             events))
+      [])))

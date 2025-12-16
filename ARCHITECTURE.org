@@ -1,0 +1,554 @@
+#+TITLE: Prusa Telemetry System Architecture
+#+AUTHOR: System Documentation
+#+DATE: Generated
+
+* System Overview
+
+The Prusa Telemetry system is a real-time monitoring and visualization platform for 3D printer telemetry data. It consists of a Clojure backend that receives UDP telemetry packets and a ClojureScript frontend that displays the data in a web browser.
+
+** Key Features
+- Real-time UDP telemetry packet reception and parsing
+- WebSocket streaming to multiple frontend clients
+- Automatic persistence of print telemetry to disk (EDN format)
+- Client-side state persistence via localStorage
+- Multiple view modes: Latest Values, Packets, Timeline
+- Timeline scrubbing and playback for historical data
+
+** Technology Stack
+- Backend: Clojure (JVM) with Aleph (HTTP/WebSocket/UDP), Manifold (streams)
+- Frontend: ClojureScript compiled to JavaScript, Reagent (React-like)
+- Build Tool: shadow-cljs
+- Development: Calva (VS Code), REPL-driven development
+
+* Architecture Layers
+
+** Backend Layer (JVM)
+
+The backend consists of two main components:
+
+*** Telemetry Server (aeonik.prusa-telemetry)
+- Receives UDP packets on port 8514 (configurable)
+- Parses raw telemetry data into structured Clojure maps
+- Applies transducer pipeline for sorting, formatting, and display preparation
+- Provides processed stream via Manifold streams
+
+*** Web Server (aeonik.web-server)
+- HTTP server on port 8080 (configurable)
+- WebSocket endpoint at /ws for real-time data streaming
+- Serves static HTML files (index.html, timeline.html)
+- Manages print lifecycle tracking and file persistence
+- Single consumer for packet saving (prevents duplicate writes)
+
+** Frontend Layer (Browser)
+
+The frontend is a single-page application with multiple views:
+
+*** Application Entry (aeonik.app)
+- Initializes application on page load
+- Loads persisted state from localStorage
+- Sets up WebSocket connection
+- Configures UI controls (pause, clear, view toggle)
+
+*** State Management (aeonik.state)
+- Single source of truth: =:telemetry-events= vector
+- Derived views: latest values, packets, timeline data
+- Auto-save to localStorage (debounced, 4MB limit)
+- State persistence across page refreshes
+
+*** Event System (aeonik.events)
+- Centralized event dispatch
+- Handles WebSocket messages, UI interactions, timeline controls
+- Pure functions for state transformations
+
+*** Views (aeonik.views)
+- Latest Values View: Shows most recent value for each metric
+- Packets View: Shows recent telemetry packets with all metrics
+- Timeline View: Time-based scrubbing and playback
+
+*** Timeline (aeonik.timeline)
+- Playback loop (100ms steps)
+- Automatic start/stop based on state
+- Watches state changes to update loop
+
+* Data Flow
+
+** Backend Data Flow
+
+#+BEGIN_SRC
+UDP Packet (Raw Text)
+    ↓
+[UDP Socket] (aleph.udp)
+    ↓
+parse-packet (parse-prelude, parse-metric-line)
+    ↓
+[parsed-stream] (Manifold stream)
+    ↓
+Transducer Pipeline:
+  - sort-metrics-xf (sort by device-time-us)
+  - add-formatted-time-xf (add formatted timestamps)
+  - format-for-display-xf (create display lines)
+    ↓
+[processed-stream] (Manifold stream)
+    ↓
+    ├─→ [Single Consumer] handle-packet-saving!
+    │   ├─→ Detect print_filename
+    │   ├─→ Track active prints (sticky, 10min timeout)
+    │   └─→ save-packet-to-file! (append-only EDN)
+    │
+    └─→ [WebSocket Handler] (per client)
+        ├─→ telemetry-to-json (convert to JSON)
+        └─→ Stream to browser via WebSocket
+#+END_SRC
+
+** Frontend Data Flow
+
+#+BEGIN_SRC
+WebSocket Message (JSON)
+    ↓
+ws/parse-ws-message
+    ↓
+events/create-events (one event per metric)
+    ↓
+events/handle-ws-message
+    ├─→ Extract print_filename
+    ├─→ Create event records with wall-time-ms
+    └─→ Append to :telemetry-events (sorted by time)
+    ↓
+state/app-state (atom)
+    ↓
+    ├─→ state/get-latest-values (derived view)
+    │   └─→ Latest View
+    │
+    ├─→ state/get-telemetry-packets (derived view)
+    │   └─→ Packets View
+    │
+    └─→ state/get-timeline-data (derived view)
+        └─→ Timeline View
+            ├─→ Timeline scrubbing
+            └─→ Timeline playback
+#+END_SRC
+
+** State Persistence Flow
+
+#+BEGIN_SRC
+Frontend State Changes
+    ↓
+add-watch on app-state
+    ↓
+schedule-save! (debounced, 1 second)
+    ↓
+save-state-to-storage!
+    ├─→ Extract persistable state
+    ├─→ Check size (4MB limit)
+    ├─→ Reduce events if needed (keep last 10k)
+    └─→ Save to localStorage (JSON)
+    ↓
+Page Refresh
+    ↓
+load-state-from-storage!
+    ├─→ Load from localStorage
+    ├─→ Merge with defaults
+    └─→ Restore :telemetry-events
+#+END_SRC
+
+* Component Details
+
+** Backend Components
+
+*** aeonik.prusa-telemetry
+
+Core telemetry parsing and processing.
+
+**** Key Functions
+
+- =start-telemetry-server= :: Creates UDP socket and stream pipeline
+- =parse-packet= :: Parses raw UDP message into structured data
+- =parse-metric-line= :: Parses individual metric lines (numeric, error, structured)
+- =parse-value= :: Tolerant value parsing (long, double, string)
+
+**** Transducers
+
+- =sort-metrics-xf= :: Sorts metrics by device-time-us
+- =add-formatted-time-xf= :: Adds formatted timestamps (wall-time-str, device-time-str)
+- =format-for-display-xf= :: Creates display-lines for console output
+
+**** Streams
+
+- =socket= :: Raw UDP socket (aleph.udp)
+- =parsed-stream= :: Parsed packets (before transducers)
+- =processed-stream= :: Fully processed packets (after transducers)
+
+*** aeonik.web-server
+
+HTTP/WebSocket server and file persistence.
+
+**** Key Functions
+
+- =start-web-server= :: Starts HTTP server and sets up consumers
+- =websocket-handler= :: Handles WebSocket connections (one per client)
+- =handle-packet-saving!= :: Single consumer for file saving (runs once per packet)
+- =telemetry-to-json= :: Converts packet to JSON-serializable format
+- =save-packet-to-file!= :: Appends packet to EDN file (append-only, one per line)
+
+**** Print Lifecycle Tracking
+
+- =active-prints= :: Atom tracking active prints per sender
+  - Format: ={sender {:filename "...", :last-packet-time <timestamp>}}=
+- =get-active-print-filename= :: Gets active print with timeout check (10 minutes)
+- =set-active-print-filename!= :: Updates active print tracking
+- =get-print-filename= :: Extracts print_filename from metrics
+
+**** File Persistence
+
+- Directory structure: =telemetry-data/prints/YYYY-MM-DD/<sanitized-filename>.edn=
+- Format: Append-only EDN (one packet per line)
+- Each packet is a complete EDN map (JSON-serializable format)
+
+** Frontend Components
+
+*** aeonik.app
+
+Application entry point and initialization.
+
+**** Key Functions
+
+- =init= :: Main initialization function
+  - Loads state from localStorage
+  - Sets up timeline selection if data exists
+  - Connects WebSocket
+  - Configures UI controls
+  - Performs initial render
+
+- =set-view-mode= :: Called from timeline.html to set view mode
+
+*** aeonik.state
+
+Central state management and persistence.
+
+**** State Structure
+
+#+BEGIN_SRC clojure
+{:ws                 nil          ; WebSocket connection
+ :connected          false        ; Connection status
+ :telemetry-events   []           ; Single vector of all events (sorted by time)
+ :paused             false        ; Pause data ingestion
+ :view-mode          :latest      ; :latest | :packets | :timeline
+ :selected-time      nil          ; Selected time for scrubbing (ms)
+ :selected-filename  nil          ; Selected print filename
+ :timeline-playing   false        ; Timeline playback active
+ :timeline-interval  nil          ; Interval ID for playback
+ :slider-dragging    false        ; User dragging timeline slider
+ :user-interacting   false}       ; User interaction flag
+#+END_SRC
+
+**** Derived View Functions
+
+- =get-latest-values= :: Latest value for each sender/metric pair
+- =get-timeline-data= :: Grouped by print_filename, sorted by time
+- =get-telemetry-packets= :: Packets grouped by sender/time, limited count
+
+**** Persistence
+
+- =save-state-to-storage!= :: Saves to localStorage (debounced, 1 second)
+- =load-state-from-storage!= :: Loads from localStorage on init
+- Size limit: 4MB (reduces to last 10k events if exceeded)
+- Persisted keys: =:telemetry-events, :selected-time, :selected-filename, :view-mode, :paused=
+
+*** aeonik.events
+
+Event dispatch and state transformations.
+
+**** Event Types
+
+- =:connection/open= :: WebSocket connected
+- =:connection/close= :: WebSocket disconnected
+- =:ws/message= :: WebSocket message received
+- =:view/set= :: Set view mode
+- =:view/set-cycle= :: Cycle through view modes
+- =:pause/toggle= :: Toggle pause state
+- =:data/clear= :: Clear all telemetry events
+- =:timeline/set-filename= :: Set selected print filename
+- =:timeline/set-time= :: Set selected time
+- =:timeline/play= :: Start timeline playback
+- =:timeline/stop= :: Stop timeline playback
+- =:timeline/tick= :: Timeline playback tick
+- =:timeline/step-forward= :: Step forward 1 second
+- =:timeline/step-backward= :: Step backward 1 second
+- =:timeline/jump-to-start= :: Jump to start of timeline
+- =:timeline/jump-to-end= :: Jump to end of timeline
+- =:slider/drag-start= :: Timeline slider drag started
+- =:slider/drag-end= :: Timeline slider drag ended
+- =:user/interacting= :: User interaction flag
+
+**** Key Functions
+
+- =dispatch!= :: Main event dispatcher (updates app-state atom)
+- =handle-event= :: Pure function for state transformations
+- =handle-ws-message= :: Processes WebSocket messages
+  - Creates event records (one per metric)
+  - Appends to :telemetry-events (maintains sort order)
+  - Ensures timeline selection is set
+- =create-events= :: Creates event records from metrics
+- =ensure-timeline-selection= :: Sets default timeline selection if missing
+
+*** aeonik.ws
+
+WebSocket connection management.
+
+**** Key Functions
+
+- =connect-websocket!= :: Establishes WebSocket connection
+  - Uses relative URL (/ws) - shadow-cljs proxies to backend automatically
+  - Sets up event handlers (onopen, onclose, onerror, onmessage)
+- =parse-ws-message= :: Parses JSON message from server
+  - Extracts sender, metrics, wall-time-str
+  - Extracts print_filename from metrics
+  - Converts to Clojure data structures
+
+*** aeonik.views
+
+View rendering functions (Reagent components).
+
+**** Views
+
+- =status-view= :: Connection status indicator
+- =latest-view= :: Latest values table (derived from :telemetry-events)
+- =packets-view= :: Recent packets list (derived from :telemetry-events)
+- =timeline-view= :: Timeline scrubbing interface (derived from :telemetry-events)
+
+*** aeonik.timeline
+
+Timeline playback loop management.
+
+**** Key Functions
+
+- =set-dispatch-callback!= :: Sets callback for timeline events
+- =start-loop!= :: Starts playback loop (100ms interval)
+- =stop-loop!= :: Stops playback loop
+- =update-loop!= :: Updates loop based on state changes
+
+**** State Watcher
+
+Watches =app-state= for changes to:
+- =:timeline-playing=
+- =:selected-filename=
+- =:telemetry-events=
+
+Automatically starts/stops loop based on state.
+
+*** aeonik.util
+
+Utility functions for formatting and parsing.
+
+**** Key Functions
+
+- =format-metric-value= :: Formats metric values for display
+- =format-time= :: Formats device time (MM:SS.mmm)
+- =parse-wall-time-str= :: Parses wall-time string (HH:mm:ss.SSS) to milliseconds
+- =format-wall-time-ms= :: Formats milliseconds to wall-time string
+- =get-metrics-at-time= :: Gets latest metrics at or before given time
+- =pad-number= :: Pads number with leading zeros
+
+*** aeonik.render
+
+DOM rendering and updates.
+
+**** Key Functions
+
+- =render!= :: Main render function (dispatches to view functions)
+- =update-timeline-display-only!= :: Updates timeline display without full render
+
+* Data Structures
+
+** Telemetry Packet (Backend)
+
+#+BEGIN_SRC clojure
+{:sender          <socket-address>    ; UDP sender address
+ :received-at     <java.util.Date>    ; Server receive time
+ :prelude         {:msg <int>         ; Message number
+                   :tm <int>          ; Base time (microseconds)
+                   :v <int>}         ; Version
+ :metrics         [{:name "metric_name"
+                    :type :numeric | :error | :structured
+                    :value <value>    ; For numeric
+                    :error <string>   ; For error
+                    :fields <map>     ; For structured
+                    :tick <int>       ; Tick offset
+                    :device-time-us <int>  ; Calculated time
+                    :device-time-str "MM:SS.mmm"}]
+ :wall-time-str   "HH:mm:ss.SSS"     ; Formatted wall time
+ :display-lines   ["formatted line"] ; For console display
+ :raw             <string>}           ; Original packet text
+#+END_SRC
+
+** Telemetry Event (Frontend)
+
+#+BEGIN_SRC clojure
+{:sender          <string>            ; Sender address as string
+ :name            <string>            ; Metric name
+ :value           <any>              ; Metric value
+ :fields          <map>              ; Structured fields
+ :error           <string>           ; Error message
+ :type            <keyword>           ; :numeric | :error | :structured
+ :tick            <int>              ; Tick offset
+ :device-time-us  <int>              ; Device time (microseconds)
+ :device-time-str "MM:SS.mmm"        ; Formatted device time
+ :wall-time-str   "HH:mm:ss.SSS"     ; Wall time string
+ :wall-time-ms    <int>              ; Wall time (milliseconds since midnight)
+ :print-filename  <string>}          ; Associated print filename
+#+END_SRC
+
+** JSON Packet (WebSocket)
+
+#+BEGIN_SRC clojure
+{:sender        <string>
+ :received-at   <long>              ; Timestamp (milliseconds)
+ :prelude       {:msg <int> :tm <int> :v <int>}
+ :metrics       [{:name <string>
+                  :type <string>   ; "numeric" | "error" | "structured"
+                  :tick <int>
+                  :device-time-us <int>
+                  :device-time-str <string>
+                  :value <any>      ; Optional
+                  :error <string>   ; Optional
+                  :fields <map>}    ; Optional
+ :display-lines [<string>]
+ :wall-time-str <string>}
+#+END_SRC
+
+* Key Concepts
+
+** Single Source of Truth
+
+The frontend uses a single =:telemetry-events= vector as the source of truth. All views are derived from this vector using pure functions:
+- =get-latest-values= :: Groups by sender/name, takes latest
+- =get-timeline-data= :: Groups by print_filename, sorts by time
+- =get-telemetry-packets= :: Groups by sender/time, limits count
+
+** Stream Processing
+
+Backend uses Manifold streams for asynchronous processing:
+- Multiple consumers can attach to a stream
+- Transducers provide efficient transformations
+- Single consumer for file saving prevents duplicates
+- Each WebSocket client gets its own consumer
+
+** Print Lifecycle Tracking
+
+The backend tracks active prints using a "sticky" mechanism:
+- When =print_filename= is detected, it becomes the active print
+- Active print persists across packets (even without =print_filename=)
+- Print ends after 10 minutes of inactivity
+- Each sender (printer) has independent print tracking
+
+** State Persistence
+
+Frontend persists state to localStorage:
+- Debounced saves (1 second delay)
+- Size limit: 4MB (reduces to last 10k events if exceeded)
+- Only persists essential state (excludes WebSocket, intervals)
+- Automatically loads on page refresh
+
+** Timeline Playback
+
+Timeline playback uses a JavaScript interval:
+- 100ms steps (10 updates per second)
+- Automatically starts/stops based on state
+- Pauses during user interaction (slider dragging)
+- Watches state changes to update loop
+
+* File Structure
+
+** Backend Files
+
+- =src/aeonik/prusa_telemetry.clj= :: UDP server, parsing, transducers
+- =src/aeonik/web_server.clj= :: HTTP/WebSocket server, file persistence
+- =dev/user.clj= :: REPL utilities, service management
+
+** Frontend Files
+
+- =src-cljs/aeonik/app.cljs= :: Application entry point
+- =src-cljs/aeonik/state.cljs= :: State management, persistence
+- =src-cljs/aeonik/events.cljs= :: Event dispatch, handlers
+- =src-cljs/aeonik/ws.cljs= :: WebSocket connection
+- =src-cljs/aeonik/views.cljs= :: View rendering
+- =src-cljs/aeonik/render.cljs= :: DOM rendering
+- =src-cljs/aeonik/timeline.cljs= :: Timeline playback loop
+- =src-cljs/aeonik/util.cljs= :: Utility functions
+
+** Configuration Files
+
+- =shadow-cljs.edn= :: ClojureScript build configuration
+- =deps.edn= :: Dependency management
+- =build.clj= :: Build scripts
+
+** Data Files
+
+- =telemetry-data/prints/YYYY-MM-DD/<filename>.edn= :: Persisted telemetry (append-only EDN)
+
+* Development Workflow
+
+** Starting Services
+
+#+BEGIN_SRC clojure
+;; In REPL (dev/user.clj auto-starts on REPL connection)
+(user/start!)                    ; Start all services
+(user/start-telemetry!)          ; Start telemetry server only
+(user/start-web!)                ; Start web server only
+(user/restart!)                   ; Restart all services
+(user/status)                     ; Check service status
+#+END_SRC
+
+** Accessing the Application
+
+- Development: =http://localhost:9630= (shadow-cljs dev server with REPL)
+  - Shadow-cljs serves HTML/JS files and proxies all requests (including /ws and /api/*) to backend on port 8080
+  - Frontend uses relative URLs - no port detection needed
+- Production: =http://localhost:8080= (direct web server)
+
+** Hot Reloading
+
+- ClojureScript: Automatic via shadow-cljs watch
+- Clojure: Manual reload via REPL (restart services after reload)
+
+** Common Issues
+
+- Data flow stops after reload: Restart web server (=user/restart!=)
+- Duplicate file writes: Fixed by single consumer pattern
+- State not persisting: Check localStorage size limit (4MB)
+
+* Performance Considerations
+
+** Backend
+
+- Stream buffering: 100-item buffers for parsed/processed streams
+- Transducer pipeline: Efficient, lazy transformations
+- Single file consumer: Prevents duplicate writes
+- Print tracking: In-memory atom (fast lookups)
+
+** Frontend
+
+- Derived views: Computed on-demand (no caching)
+- State persistence: Debounced to avoid excessive writes
+- Timeline playback: 100ms interval (10 FPS)
+- Event sorting: Maintains sorted order on append (O(n log n))
+
+** Scalability
+
+- Multiple WebSocket clients: Each gets own consumer (scales linearly)
+- File persistence: Append-only writes (efficient)
+- State size: 4MB localStorage limit (prevents browser slowdown)
+- Event count: No hard limit (limited by localStorage size)
+
+* Future Improvements
+
+** Potential Enhancements
+
+- Add metrics aggregation/statistics
+- Implement data compression for localStorage
+- Add export/import functionality for telemetry data
+- Support multiple printers with separate tracking
+- Add real-time charts/graphs
+- Implement data filtering/search
+- Add print comparison features
+- Support for historical data queries

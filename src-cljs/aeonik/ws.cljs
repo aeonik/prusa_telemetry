@@ -6,6 +6,12 @@
   (let [sender (aget data "sender")
         metrics (aget data "metrics")
         wall-time-str (aget data "wall-time-str")
+        prelude-obj (aget data "prelude")
+        prelude (when prelude-obj
+                  {:msg (aget prelude-obj "msg")
+                   :tm (aget prelude-obj "tm")
+                   :v (aget prelude-obj "v")})
+        received-at (aget data "received-at")
         ;; Extract print_filename
         print-filename-metric (first (filter #(= (aget % "name") "print_filename") (array-seq metrics)))
         print-filename (if print-filename-metric
@@ -36,15 +42,14 @@
      :sender sender
      :metrics metrics-clj
      :wall-time-str wall-time-str
+     :prelude prelude
+     :received-at received-at
      :print-filename print-filename}))
 
 (defn connect-websocket! []
   (let [protocol (if (= js/location.protocol "https:") "wss:" "ws:")
-        current-port (str js/location.port)
-        ws-host (if (#{"9630" "9631"} current-port)
-                  (str js/location.hostname ":8080")
-                  js/location.host)
-        ws-url (str protocol "//" ws-host "/ws")
+        ;; Use relative URL - shadow-cljs proxies /ws to backend automatically
+        ws-url (str protocol "//" js/location.host "/ws")
         socket (js/WebSocket. ws-url)]
     (println "Connecting to WebSocket:" ws-url)
     (swap! app-state assoc :ws socket)

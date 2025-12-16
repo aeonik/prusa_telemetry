@@ -1,5 +1,6 @@
 (ns aeonik.state
-  (:require [reagent.core :as r]))
+  (:require [reagent.core :as r]
+            [reagent.ratom :as ratom]))
 
 (def ^:private storage-key "prusa-telemetry-state")
 
@@ -8,9 +9,44 @@
    {:telemetry-events   []      ; All telemetry events, sorted by time
     :available-files    []      ; Available telemetry files from disk
     :view-mode          :latest ; :latest | :packets | :timeline
-    :selected-time      nil     ; Selected time for timeline scrubbing (milliseconds)
+    :selected-packet-msg nil     ; Selected packet msg number for timeline scrubbing
     :selected-filename  nil     ; Selected file identifier (format: "date:filename")
     :timeline-playing   false})) ; Timeline auto-play state
+
+;; Cached timeline data - updated only when :telemetry-events changes
+(defonce cached-timeline-data (r/atom {}))
+
+;; Internal implementation - derive timeline-data map (print_filename -> packets) from telemetry-events
+;; Packets are grouped by msg number, with events sorted by device-time-us within each packet
+(defn- get-timeline-data-impl
+  [events]
+  (let [events-with-filename (filter #(some? (:print-filename %)) events)
+        ;; Filter out events without packet-msg - they can't be used in timeline view
+        events-with-packet (filter #(some? (:packet-msg %)) events-with-filename)
+        grouped-by-filename (group-by :print-filename events-with-packet)]
+    (reduce-kv (fn [acc filename events]
+                 ;; Group events by packet-msg, then sort packets by msg number
+                 (let [packets-by-msg (group-by :packet-msg events)
+                       sorted-packets (->> packets-by-msg
+                                          (map (fn [[msg packet-events]]
+                                                 {:packet-msg msg
+                                                  :received-at (some :received-at packet-events)
+                                                  :events (sort-by :device-time-us packet-events)}))
+                                          (sort-by :packet-msg))]
+                   (assoc acc filename sorted-packets)))
+               {}
+               grouped-by-filename)))
+
+;; Initialize cache with current events
+(reset! cached-timeline-data (get-timeline-data-impl (:telemetry-events @app-state)))
+
+;; Watch :telemetry-events and update cache only when it changes
+(add-watch app-state :timeline-data-cache
+           (fn [_ _ old-state new-state]
+             (let [old-events (:telemetry-events old-state)
+                   new-events (:telemetry-events new-state)]
+               (when (not= old-events new-events)
+                 (reset! cached-timeline-data (get-timeline-data-impl new-events))))))
 
 ;; Helper functions to derive views from :telemetry-events
 
@@ -19,7 +55,7 @@
   [events]
   (let [grouped (group-by (fn [e] (str (:sender e) "/" (:name e))) events)
         latest-map (reduce-kv (fn [acc k events]
-                                 (let [sorted (sort-by (fn [e] (or (:wall-time-ms e) 0)) events)
+                                 (let [sorted (sort-by (fn [e] (or (:device-time-us e) 0)) events)
                                        latest (last sorted)]
                                    (assoc acc k latest)))
                                {}
@@ -27,14 +63,13 @@
     latest-map))
 
 (defn get-timeline-data
-  "Derive timeline-data map (print_filename -> metrics) from telemetry-events"
+  "Derive timeline-data map (print_filename -> metrics) from telemetry-events.
+   If events is provided, computes directly (for backwards compatibility).
+   If nil, returns cached value that only updates when :telemetry-events changes."
   [events]
-  (let [events-with-filename (filter #(some? (:print-filename %)) events)
-        grouped-by-filename (group-by :print-filename events-with-filename)]
-    (reduce-kv (fn [acc filename events]
-                 (assoc acc filename (sort-by (fn [e] (or (:wall-time-ms e) 0)) events)))
-               {}
-               grouped-by-filename)))
+  (if (nil? events)
+    @cached-timeline-data
+    (get-timeline-data-impl events)))
 
 (defn get-telemetry-packets
   "Derive telemetry-data (packets view) from telemetry-events"
@@ -57,14 +92,16 @@
                      grouped-by-packet)]
     (vec (take-last limit packets))))
 
-(defn- get-persistable-state [state]
+(defn- get-persistable-state
   "Extract only UI preferences that should be persisted"
+  [state]
   (select-keys state [:selected-time
                       :selected-filename
                       :view-mode]))
 
-(defn save-state-to-storage! []
+(defn save-state-to-storage!
   "Save small UI preferences to localStorage (synchronous, fast for small data)"
+  []
   (try
     (let [state @app-state
           persistable (get-persistable-state state)]
@@ -79,9 +116,10 @@
 (defonce save-timeout (atom nil))
 (defonce loading-state? (atom false))
 
-(defn load-state-from-storage! []
+(defn load-state-from-storage!
   "Load small UI preferences from localStorage and merge into current state.
    Note: telemetry-events are NOT loaded - they must be loaded from server files."
+  []
   (try
     (reset! loading-state? true)
     (when-let [stored (.getItem js/localStorage storage-key)]
@@ -106,8 +144,9 @@
 
 ;; Note: loading-state? must be defined before load-state-from-storage! uses it
 
-(defn- schedule-save! []
+(defn- schedule-save!
   "Schedule a save operation with debouncing"
+  []
   ;; Don't save if we're currently loading state
   (when-not @loading-state?
     (when-let [timeout @save-timeout]
@@ -212,8 +251,9 @@
   (js/console.log "App State:" @app-state)
   (println "State printed to console"))
 
-(defn clear-stored-state! []
+(defn clear-stored-state!
   "Clear the persisted UI preferences from localStorage"
+  []
   (try
     (.removeItem js/localStorage storage-key)
     (println "Stored UI preferences cleared from localStorage")

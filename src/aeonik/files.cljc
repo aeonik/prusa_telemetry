@@ -54,10 +54,24 @@
     (->> (if (sequential? packets) packets [])
          (filter map?)
          (map (fn [packet]
-                (let [metrics (vec (or (:metrics packet) []))]
+                (let [metrics (vec (or (:metrics packet) []))
+                      prelude (:prelude packet)
+                      received-at (:received-at packet)
+                      ;; Ensure received-at is a number (milliseconds) - handle both Date objects and numbers
+                      received-at-ms (cond
+                                      (number? received-at) received-at
+                                      (string? received-at) (parse-long-safe received-at)
+                                      :else
+                                      #?(:clj (when (instance? java.util.Date received-at)
+                                                (.getTime received-at))
+                                         :cljs (when (instance? js/Date received-at)
+                                                 (.getTime received-at))
+                                         :default nil))]
                   {:sender        (as-string (:sender packet))
                    :wall-time-str (as-string (:wall-time-str packet))
                    :wall-time-ms  (parse-long-safe (:wall-time-ms packet))
+                   :prelude       prelude  ; Preserve prelude for packet-msg extraction
+                   :received-at   received-at-ms  ; Preserve received-at as milliseconds for wall-time calculation
                    :metrics       (->> metrics
                                        (filter map?)
                                        (mapv (fn [m]

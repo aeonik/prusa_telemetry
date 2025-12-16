@@ -32,20 +32,20 @@
 
 (defn- ensure-timeline-selection!
   "Parameters: none.
-   Returns: nil after ensuring timeline defaults are populated."
+   Returns: nil after ensuring timeline defaults are populated.
+   Uses packet msg numbers for timeline operations."
   []
   (let [events (:telemetry-events @app-state)
         timeline-data (state/get-timeline-data events)
         filenames (keys timeline-data)]
     (when (seq filenames)
       (let [current-filename (or (:selected-filename @app-state) (first filenames))
-            all-metrics (get timeline-data current-filename [])
-            metrics-with-time (filter #(some? (:wall-time-ms %)) all-metrics)]
-        (when (seq metrics-with-time)
-          (let [times (map :wall-time-ms metrics-with-time)
-                max-time (apply max times)]
-            (when (nil? (:selected-time @app-state))
-              (dispatch! {:type :timeline/set-time :time max-time}))
+            packets (get timeline-data current-filename [])]
+        (when (seq packets)
+          (let [packet-msg-numbers (map :packet-msg packets)
+                max-msg (apply max packet-msg-numbers)]
+            (when (nil? (:selected-packet-msg @app-state))
+              (dispatch! {:type :timeline/set-packet-msg :packet-msg max-msg}))
             (when (nil? (:selected-filename @app-state))
               (dispatch! {:type :timeline/set-filename :filename current-filename}))))))))
 

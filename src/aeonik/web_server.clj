@@ -249,7 +249,8 @@
        :body (json/write-str {:error (.getMessage e)})})))
 
 (defn load-telemetry-file-handler
-  "Load a telemetry data file by date and filename"
+  "Load a telemetry data file by date and filename.
+   Files are already grouped and sorted when saved, so we just read and return them."
   [req]
   (try
     (let [uri (:uri req)
@@ -259,18 +260,18 @@
         (let [[_ date filename] match
               file-path (io/file prints-dir date filename)]
           (if (and (.exists file-path) (.isFile file-path))
+            ;; Read packets line by line - they're already in correct format
             (let [packets (with-open [reader (io/reader file-path)]
-                           (doall (map (fn [line]
-                                        (try
-                                          (edn/read-string line)
-                                          (catch Exception e
-                                            (println "Error reading line:" line (.getMessage e))
-                                            nil)))
-                                      (line-seq reader))))
-                  valid-packets (filter some? packets)]
+                           (doall (keep (fn [line]
+                                         (try
+                                           (edn/read-string line)
+                                           (catch Exception e
+                                             (println "Error reading line:" (.getMessage e))
+                                             nil)))
+                                       (line-seq reader))))]
               {:status 200
                :headers {"Content-Type" "application/json"}
-               :body (json/write-str valid-packets)})
+               :body (json/write-str packets)})
             {:status 404
              :headers {"Content-Type" "application/json"}
              :body (json/write-str {:error "File not found"})}))
@@ -288,11 +289,12 @@
   "Start HTTP server with WebSocket support for telemetry streaming.
    
    In development, shadow-cljs serves HTML/JS files on port 9630 and proxies
-   /ws requests to this server. Access the app via http://localhost:9630 for REPL support.
+   all non-static requests (including /ws and /api/*) to this server.
+   Access the app via http://localhost:9630 for REPL support.
    
    Returns {:server .. :stop! (fn [])}
    Options:
-   - :port (default 8080) - WebSocket server port (shadow-cljs proxies to this)
+   - :port (default 8080) - Backend server port (shadow-cljs proxies to this)
    - :telemetry-stream (required) - the processed stream from telemetry server"
   [{:keys [port telemetry-stream]
     :or {port 8080}}]

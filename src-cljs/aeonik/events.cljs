@@ -10,9 +10,14 @@
 
 (defn- create-events
   "Create event records from metrics, one per metric.
-   Returns a vector, never lazy sequences."
-  [sender metrics wall-time-str print-filename]
-  (let [wall-time-ms (u/parse-wall-time-str wall-time-str)]
+   Returns a vector, never lazy sequences.
+   Device-time-us comes from the metrics themselves (calculated from prelude tm + tick).
+   Packet metadata (msg, received-at) is included for timeline navigation."
+  [sender metrics wall-time-str print-filename packet-msg received-at]
+  (let [wall-time-ms (or (u/parse-wall-time-str wall-time-str)
+                         (when wall-time-str
+                           (println "Warning: Failed to parse wall-time-str:" wall-time-str)
+                           nil))]
     (vec (map (fn [m]
                 {:sender          sender
                  :name            (:name m)
@@ -25,29 +30,34 @@
                  :device-time-str (:device-time-str m)
                  :wall-time-str   wall-time-str
                  :wall-time-ms    wall-time-ms
+                 :packet-msg      packet-msg
+                 :received-at     received-at
                  :print-filename  print-filename})
               metrics))))
 
 (defn- time-range
+  "Calculate time range from events using device-time-us (microseconds)"
   [events]
   (when (seq events)
-    (let [events-with-time (filter #(some? (:wall-time-ms %)) events)]
+    (let [events-with-time (filter #(some? (:device-time-us %)) events)]
       (when (seq events-with-time)
-        (let [times (map :wall-time-ms events-with-time)
+        (let [times (map :device-time-us events-with-time)
               min-t (apply min times)
               max-t (apply max times)]
           {:min min-t :max max-t})))))
 
-(defn- strip-quotes [s]
+(defn- strip-quotes
   "Remove leading/trailing quotes from a string"
+  [s]
   (when s
     (-> (str s)
         (str/replace #"^[\"']+" "")
         (str/replace #"[\"']+$" "")
         str/trim)))
 
-(defn- normalize-filename-for-matching [filename timeline-filenames]
+(defn- normalize-filename-for-matching
   "Try to match filename to one in timeline-filenames, handling format differences"
+  [filename timeline-filenames]
   (let [normalize (fn [f]
                    (-> f
                        strip-quotes
@@ -74,25 +84,29 @@
                                 (when print-filename
                                   (normalize-filename-for-matching print-filename filenames))
                                 (first filenames))
-            all-metrics (get timeline-data current-filename [])
-            {:keys [min max] :as tr} (time-range all-metrics)]
+            packets (get timeline-data current-filename [])]
         (when (not= selected-filename-from-state current-filename)
           (println "Filename normalized from" selected-filename-from-state "to" current-filename))
-        (let [current-time (:selected-time state)
-              ;; Set time if nil, or if it's outside the valid range
-              should-set-time (and tr (or (nil? current-time)
-                                         (< current-time min)
-                                         (> current-time max)))]
-          (cond-> state
-            ;; Always set filename to the normalized version that matches timeline-data
-            (or (nil? (:selected-filename state))
-                (not= (:selected-filename state) current-filename))
-            (assoc :selected-filename current-filename)
-            
-            ;; Set time to max when data exists and time is nil or out of range
-            ;; This ensures the timeline shows data after loading
-            should-set-time
-            (assoc :selected-time max)))))))
+        (if (seq packets)
+          (let [packet-msg-numbers (map :packet-msg packets)
+                min-msg (apply min packet-msg-numbers)
+                max-msg (apply max packet-msg-numbers)
+                current-packet-msg (:selected-packet-msg state)
+                ;; Set packet-msg if nil, or if it's outside the valid range
+                should-set-packet-msg (or (nil? current-packet-msg)
+                                         (< current-packet-msg min-msg)
+                                         (> current-packet-msg max-msg))]
+            (cond-> state
+              ;; Always set filename to the normalized version that matches timeline-data
+              (or (nil? (:selected-filename state))
+                  (not= (:selected-filename state) current-filename))
+              (assoc :selected-filename current-filename)
+              
+              ;; Set packet-msg to max when data exists and packet-msg is nil or out of range
+              ;; This ensures the timeline shows data after loading
+              should-set-packet-msg
+              (assoc :selected-packet-msg max-msg)))
+          state)))))
 
 (defn- extract-print-filename-from-metrics
   "Extract print_filename from a list of metrics, stripping quotes and normalizing"
@@ -114,13 +128,13 @@
     cleaned))
 
 (defn- get-event-time
-  "Get wall-time-ms from event, defaulting to 0"
+  "Get device-time-us from event, defaulting to 0"
   [e]
-  (or (:wall-time-ms e) 0))
+  (or (:device-time-us e) 0))
 
 (defn- merge-sorted-events
   "Efficiently merge two sorted event vectors into one sorted vector.
-   Both vectors should already be sorted by wall-time-ms.
+   Both vectors should already be sorted by device-time-us.
    This is O(n+m) instead of O(n*log(n+m)) for sort.
    Returns a vector, never lazy sequences."
   [existing-events new-events]
@@ -155,15 +169,23 @@
                 (recur (conj! result (get new-vec new-idx))
                        existing-idx (inc new-idx) existing-len new-len)))))))))
 (defn- packets-to-events
-  "Convert telemetry packets to event records, sorted by wall-time-ms.
-   Returns a vector, never lazy sequences."
+  "Convert telemetry packets to event records, sorted by device-time-us.
+   Returns a vector, never lazy sequences.
+   Packets from files are already sorted, but we still need to sort events within packets."
   [packets]
   (let [events-vec (reduce (fn [acc packet]
                               (let [sender (:sender packet)
                                     metrics (:metrics packet)
                                     wall-time-str (:wall-time-str packet)
+                                    prelude (:prelude packet)
+                                    packet-msg (:msg prelude)
+                                    received-at (:received-at packet)
                                     print-filename (extract-print-filename-from-metrics metrics)
-                                    new-events (create-events sender metrics wall-time-str print-filename)]
+                                    new-events (create-events sender metrics wall-time-str print-filename packet-msg received-at)]
+                                ;; Log if we have events without device-time-us
+                                (when (and (seq new-events) (nil? (:device-time-us (first new-events))))
+                                  (println "Warning: Packet has no device-time-us. wall-time-str:" wall-time-str
+                                           "sender:" sender "metrics count:" (count metrics)))
                                 ;; Use reduce with conj! for transient vectors, not into
                                 (reduce conj! acc new-events)))
                             (transient [])
@@ -249,21 +271,23 @@
               (ensure-timeline-selection nil)))))))
 
 (defn- handle-ws-message
-  [state {:keys [sender metrics wall-time-str print-filename]}]
+  [state {:keys [sender metrics wall-time-str print-filename prelude received-at]}]
   (if (not (map? state))
     (do
       (println "Error: handle-ws-message received non-map state:" (type state) state)
       {:telemetry-events [] :available-files [] :view-mode :latest})
-    (let [new-events-unsorted (create-events sender metrics wall-time-str print-filename)
+    (let [packet-msg (:msg prelude)
+          received-at-ms (when received-at (if (number? received-at) received-at (.getTime received-at)))
+          new-events-unsorted (create-events sender metrics wall-time-str print-filename packet-msg received-at-ms)
           ;; Sort new events before merging (they're from a single packet, so should be small)
           new-events (vec (sort-by get-event-time new-events-unsorted))
           updated-events (merge-sorted-events (:telemetry-events state) new-events)
           updated-state (assoc state :telemetry-events updated-events)]
-      (when (and (seq new-events) (nil? (:wall-time-ms (first new-events))))
-        (println "Warning: Events created without wall-time-ms. wall-time-str:" wall-time-str))
+      (when (and (seq new-events) (nil? (:device-time-us (first new-events))))
+        (println "Warning: Events created without device-time-us. wall-time-str:" wall-time-str))
       ;; Only call ensure-timeline-selection if selection is missing or if we have a new filename
       (if (or (nil? (:selected-filename updated-state))
-              (nil? (:selected-time updated-state))
+              (nil? (:selected-packet-msg updated-state))
               (and print-filename (not= print-filename (:selected-filename updated-state))))
         (ensure-timeline-selection updated-state print-filename)
         updated-state))))
@@ -271,8 +295,6 @@
 ;; ============================================================================
 ;; Timeline event handlers
 ;; ============================================================================
-
-(def ^:private one-second-ms 1000)
 
 (defn- clamp-forward
   [current {:keys [max]} step]
@@ -285,32 +307,33 @@
     (max min (- current step))))
 
 (defn- handle-timeline-tick
-  [state {:keys [step-ms time-range]}]
-  (let [current (:selected-time state)
-        max-t   (:max time-range)]
-    (if (and current time-range (< current max-t))
-      (assoc state :selected-time (min max-t (+ current step-ms)))
+  "Handle timeline tick - step is number of packets"
+  [state {:keys [step packet-range]}]
+  (let [current (:selected-packet-msg state)
+        max-msg (:max packet-range)]
+    (if (and current packet-range (< current max-msg))
+      (assoc state :selected-packet-msg (min max-msg (+ current (or step 1))))
       (assoc state :timeline-playing false))))
 
 (defn- handle-step-forward
-  [state {:keys [time-range]}]
-  (if-let [new-t (clamp-forward (:selected-time state) time-range one-second-ms)]
-    (assoc state :selected-time new-t)
+  [state {:keys [packet-range]}]
+  (if-let [new-msg (clamp-forward (:selected-packet-msg state) packet-range 1)]
+    (assoc state :selected-packet-msg new-msg)
     state))
 
 (defn- handle-step-backward
-  [state {:keys [time-range]}]
-  (if-let [new-t (clamp-backward (:selected-time state) time-range one-second-ms)]
-    (assoc state :selected-time new-t)
+  [state {:keys [packet-range]}]
+  (if-let [new-msg (clamp-backward (:selected-packet-msg state) packet-range 1)]
+    (assoc state :selected-packet-msg new-msg)
     state))
 
 (defn- handle-jump-to-start
-  [state {:keys [time-range]}]
-  (assoc state :selected-time (:min time-range)))
+  [state {:keys [packet-range]}]
+  (assoc state :selected-packet-msg (:min packet-range)))
 
 (defn- handle-jump-to-end
-  [state {:keys [time-range]}]
-  (assoc state :selected-time (:max time-range)))
+  [state {:keys [packet-range]}]
+  (assoc state :selected-packet-msg (:max packet-range)))
 
 ;; ============================================================================
 ;; Main event handler
@@ -335,8 +358,8 @@
     :timeline/set-filename
     (assoc state :selected-filename (:filename ev))
 
-    :timeline/set-time
-    (assoc state :selected-time (:time ev))
+    :timeline/set-packet-msg
+    (assoc state :selected-packet-msg (:packet-msg ev))
 
     :timeline/play
     (assoc state :timeline-playing true)

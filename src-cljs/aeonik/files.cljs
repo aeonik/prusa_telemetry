@@ -3,13 +3,10 @@
             [clojure.string :as str]))
 
 (defn- get-api-base-url
-  "Get the base URL for API calls, handling dev server port differences"
+  "Get the base URL for API calls.
+   Uses relative URLs - shadow-cljs proxies API requests to backend automatically."
   []
-  (let [current-port (str js/location.port)
-        api-host (if (#{"9630" "9631"} current-port)
-                   (str js/location.hostname ":8080")
-                   js/location.host)]
-    (str js/location.protocol "//" api-host)))
+  (str js/location.protocol "//" js/location.host))
 
 (defn fetch-available-files!
   "Fetch list of available telemetry files from the server and update app-state"
