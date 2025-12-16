@@ -5,19 +5,12 @@
 
 (defonce app-state
   (r/atom
-   {:ws                 nil
-    :connected          false
-    :telemetry-events   []      ; Single vector of all telemetry events (live + loaded), sorted by time
-    :available-files    []      ; List of available telemetry files from disk
-    :paused             false
+   {:telemetry-events   []      ; All telemetry events, sorted by time
+    :available-files    []      ; Available telemetry files from disk
     :view-mode          :latest ; :latest | :packets | :timeline
-    :selected-time      nil     ; Selected time for scrubbing (in milliseconds)
-    :selected-filename  nil     ; Selected print filename
-    :timeline-playing   false
-    :timeline-interval  nil     ; Interval ID for auto-play
-    :slider-dragging    false
-    :dropdown-interacting false ; Track when dropdown is being interacted with
-    :user-interacting   false}))
+    :selected-time      nil     ; Selected time for timeline scrubbing (milliseconds)
+    :selected-filename  nil     ; Selected file identifier (format: "date:filename")
+    :timeline-playing   false})) ; Timeline auto-play state
 
 ;; Helper functions to derive views from :telemetry-events
 
@@ -65,16 +58,10 @@
     (vec (take-last limit packets))))
 
 (defn- get-persistable-state [state]
-  "Extract only the small UI preferences that should be persisted.
-   Note: telemetry-events are NOT persisted - they're loaded from server when needed."
+  "Extract only UI preferences that should be persisted"
   (select-keys state [:selected-time
                       :selected-filename
-                      :view-mode
-                      :paused
-                      ;; Note: telemetry-events and available-files are NOT persisted
-                      ;; - events are loaded from server files when needed
-                      ;; - available-files is fetched fresh on load
-                      ]))
+                      :view-mode]))
 
 (defn save-state-to-storage! []
   "Save small UI preferences to localStorage (synchronous, fast for small data)"
@@ -141,9 +128,7 @@
   "Export current app-state to JSON and trigger download"
   []
   (let [state @app-state
-        ;; Remove non-serializable values
-        clean-state (dissoc state :ws :timeline-interval)
-        json-str (js/JSON.stringify (clj->js clean-state) nil 2)
+        json-str (js/JSON.stringify (clj->js state) nil 2)
         blob (js/Blob. #js [json-str] #js {:type "application/json"})
         url (.createObjectURL js/URL blob)
         link (.createElement js/document "a")]
@@ -209,10 +194,7 @@
   "Export current app-state to EDN (pretty-printed) and trigger download"
   []
   (let [state @app-state
-        ;; Remove non-serializable values
-        clean-state (dissoc state :ws :timeline-interval)
-        ;; Pretty print the EDN
-        edn-str (pretty-print-value clean-state 0)
+        edn-str (pretty-print-value state 0)
         blob (js/Blob. #js [edn-str] #js {:type "text/plain"})
         url (.createObjectURL js/URL blob)
         link (.createElement js/document "a")]
@@ -227,10 +209,8 @@
 (defn dump-state-to-console
   "Print current app-state to console (for debugging)"
   []
-  (let [state @app-state
-        clean-state (dissoc state :ws :timeline-interval)]
-    (js/console.log "App State:" clean-state)
-    (println "State printed to console")))
+  (js/console.log "App State:" @app-state)
+  (println "State printed to console"))
 
 (defn clear-stored-state! []
   "Clear the persisted UI preferences from localStorage"

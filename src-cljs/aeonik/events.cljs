@@ -1,7 +1,8 @@
 (ns aeonik.events
   (:require [aeonik.state :refer [app-state] :as state]
             [aeonik.timeline :as timeline]
-            [aeonik.util :as u]))
+            [aeonik.util :as u]
+            [clojure.string :as str]))
 
 ;; ============================================================================
 ;; WebSocket message handlers
@@ -37,6 +38,28 @@
               max-t (apply max times)]
           {:min min-t :max max-t})))))
 
+(defn- strip-quotes [s]
+  "Remove leading/trailing quotes from a string"
+  (when s
+    (-> (str s)
+        (str/replace #"^[\"']+" "")
+        (str/replace #"[\"']+$" "")
+        str/trim)))
+
+(defn- normalize-filename-for-matching [filename timeline-filenames]
+  "Try to match filename to one in timeline-filenames, handling format differences"
+  (let [normalize (fn [f]
+                   (-> f
+                       strip-quotes
+                       (str/replace #"^_" "")
+                       (str/replace #"\.edn$" "")))
+        normalized-input (normalize filename)
+        find-match (fn [timeline-fname]
+                    (= normalized-input (normalize timeline-fname)))]
+    (or (some #(when (= filename %) %) timeline-filenames)
+        (some #(when (find-match %) %) timeline-filenames)
+        filename)))
+
 (defn- ensure-timeline-selection
   [state print-filename]
   (let [events (:telemetry-events state)
@@ -44,29 +67,51 @@
         filenames (keys timeline-data)]
     (if (empty? filenames)
       state
-      (let [current-filename (or (:selected-filename state)
-                                 (when print-filename print-filename)
-                                 (first filenames))
+      (let [selected-filename-from-state (:selected-filename state)
+            ;; Normalize the selected filename to match timeline-data keys
+            current-filename (or (when selected-filename-from-state
+                                  (normalize-filename-for-matching selected-filename-from-state filenames))
+                                (when print-filename
+                                  (normalize-filename-for-matching print-filename filenames))
+                                (first filenames))
             all-metrics (get timeline-data current-filename [])
-            {:keys [max] :as tr} (time-range all-metrics)]
-        (cond-> state
-          (and tr (nil? (:selected-time state)))
-          (assoc :selected-time max)
-
-          (and current-filename (nil? (:selected-filename state)))
-          (assoc :selected-filename current-filename))))))
+            {:keys [min max] :as tr} (time-range all-metrics)]
+        (when (not= selected-filename-from-state current-filename)
+          (println "Filename normalized from" selected-filename-from-state "to" current-filename))
+        (let [current-time (:selected-time state)
+              ;; Set time if nil, or if it's outside the valid range
+              should-set-time (and tr (or (nil? current-time)
+                                         (< current-time min)
+                                         (> current-time max)))]
+          (cond-> state
+            ;; Always set filename to the normalized version that matches timeline-data
+            (or (nil? (:selected-filename state))
+                (not= (:selected-filename state) current-filename))
+            (assoc :selected-filename current-filename)
+            
+            ;; Set time to max when data exists and time is nil or out of range
+            ;; This ensures the timeline shows data after loading
+            should-set-time
+            (assoc :selected-time max)))))))
 
 (defn- extract-print-filename-from-metrics
-  "Extract print_filename from a list of metrics"
+  "Extract print_filename from a list of metrics, stripping quotes and normalizing"
   [metrics]
-  (let [print-filename-metric (first (filter #(= (:name %) "print_filename") metrics))]
-    (when print-filename-metric
-      (or (:value print-filename-metric)
-          (when-let [fields (:fields print-filename-metric)]
-            (if (map? fields)
-              (or (get fields "value")
-                  (first (vals fields)))
-              nil))))))
+  (let [print-filename-metric (first (filter #(= (:name %) "print_filename") metrics))
+        raw-value (when print-filename-metric
+                   (or (:value print-filename-metric)
+                       (when-let [fields (:fields print-filename-metric)]
+                         (if (map? fields)
+                           (or (get fields "value")
+                               (first (vals fields)))
+                           nil))))
+        ;; Strip quotes and normalize
+        cleaned (when raw-value
+                 (-> (str raw-value)
+                     (str/replace #"^[\"']" "")
+                     (str/replace #"[\"']$" "")
+                     str/trim))]
+    cleaned))
 
 (defn- get-event-time
   "Get wall-time-ms from event, defaulting to 0"
@@ -119,8 +164,8 @@
                                     wall-time-str (:wall-time-str packet)
                                     print-filename (extract-print-filename-from-metrics metrics)
                                     new-events (create-events sender metrics wall-time-str print-filename)]
-                                ;; Use into to build vector eagerly, not concat (which is lazy)
-                                (into acc new-events)))
+                                ;; Use reduce with conj! for transient vectors, not into
+                                (reduce conj! acc new-events)))
                             (transient [])
                             packets)]
     ;; Sort events from this packet batch (already a vector, sort returns vector)
@@ -138,7 +183,7 @@
   (if (not (map? state))
     (do
       (println "Error: load-telemetry-packets-batch received non-map state:" (type state) state)
-      {:ws nil :connected false :telemetry-events [] :available-files [] :paused false :view-mode :latest})
+      {:telemetry-events [] :available-files [] :view-mode :latest})
     (if (or (nil? packets-batch) (not (sequential? packets-batch)) (empty? packets-batch))
       state
       (let [new-events (packets-to-events packets-batch)
@@ -150,10 +195,12 @@
   [batches batch-index]
   (if (>= batch-index (count batches))
     (do
-      ;; Only call ensure-timeline-selection once at the end of all batches
-      (swap! app-state ensure-timeline-selection nil)
-      (reset! batch-processing-state nil)
-      (println "Finished processing all packets"))
+      ;; All batches processed - ensure timeline selection is set
+      (js/setTimeout
+       (fn []
+         (swap! app-state #(ensure-timeline-selection % nil))
+         (reset! batch-processing-state nil))
+       100))
     (let [batch (nth batches batch-index)
           current-state @app-state
           new-state (load-telemetry-packets-batch current-state batch)]
@@ -182,7 +229,7 @@
   (if (not (map? state))
     (do
       (println "Error: load-telemetry-packets received non-map state:" (type state) state)
-      {:ws nil :connected false :telemetry-events [] :available-files [] :paused false :view-mode :latest})
+      {:telemetry-events [] :available-files [] :view-mode :latest})
     (if (or (nil? packets) (not (sequential? packets)))
       (do
         (println "Warning: load-telemetry-packets called with invalid packets:" packets)
@@ -206,22 +253,20 @@
   (if (not (map? state))
     (do
       (println "Error: handle-ws-message received non-map state:" (type state) state)
-      {:ws nil :connected false :telemetry-events [] :available-files [] :paused false :view-mode :latest})
-    (if (:paused state)
-      state
-      (let [new-events-unsorted (create-events sender metrics wall-time-str print-filename)
-            ;; Sort new events before merging (they're from a single packet, so should be small)
-            new-events (vec (sort-by get-event-time new-events-unsorted))
-            updated-events (merge-sorted-events (:telemetry-events state) new-events)
-            updated-state (assoc state :telemetry-events updated-events)]
-        (when (and (seq new-events) (nil? (:wall-time-ms (first new-events))))
-          (println "Warning: Events created without wall-time-ms. wall-time-str:" wall-time-str))
-        ;; Only call ensure-timeline-selection if selection is missing or if we have a new filename
-        (if (or (nil? (:selected-filename updated-state))
-                (nil? (:selected-time updated-state))
-                (and print-filename (not= print-filename (:selected-filename updated-state))))
-          (ensure-timeline-selection updated-state print-filename)
-          updated-state)))))
+      {:telemetry-events [] :available-files [] :view-mode :latest})
+    (let [new-events-unsorted (create-events sender metrics wall-time-str print-filename)
+          ;; Sort new events before merging (they're from a single packet, so should be small)
+          new-events (vec (sort-by get-event-time new-events-unsorted))
+          updated-events (merge-sorted-events (:telemetry-events state) new-events)
+          updated-state (assoc state :telemetry-events updated-events)]
+      (when (and (seq new-events) (nil? (:wall-time-ms (first new-events))))
+        (println "Warning: Events created without wall-time-ms. wall-time-str:" wall-time-str))
+      ;; Only call ensure-timeline-selection if selection is missing or if we have a new filename
+      (if (or (nil? (:selected-filename updated-state))
+              (nil? (:selected-time updated-state))
+              (and print-filename (not= print-filename (:selected-filename updated-state))))
+        (ensure-timeline-selection updated-state print-filename)
+        updated-state))))
 
 ;; ============================================================================
 ;; Timeline event handlers
@@ -245,9 +290,7 @@
         max-t   (:max time-range)]
     (if (and current time-range (< current max-t))
       (assoc state :selected-time (min max-t (+ current step-ms)))
-      (-> state
-          (assoc :timeline-playing false)
-          (assoc :timeline-interval nil)))))
+      (assoc state :timeline-playing false))))
 
 (defn- handle-step-forward
   [state {:keys [time-range]}]
@@ -275,15 +318,6 @@
 
 (defn handle-event [state {:keys [type] :as ev}]
   (case type
-    :connection/open
-    (assoc state :connected true)
-
-    :connection/close
-    (assoc state :connected false)
-
-    :ws/message
-    (handle-ws-message state ev)
-
     :view/set
     (assoc state :view-mode (:mode ev))
 
@@ -295,16 +329,11 @@
                  :latest)]
       (assoc state :view-mode next))
 
-    :pause/toggle
-    (update state :paused not)
-
     :data/clear
     (assoc state :telemetry-events [])
 
     :timeline/set-filename
-    (-> state
-        (assoc :selected-filename (:filename ev))
-        (assoc :selected-time nil))
+    (assoc state :selected-filename (:filename ev))
 
     :timeline/set-time
     (assoc state :selected-time (:time ev))
@@ -330,20 +359,6 @@
     :timeline/jump-to-end
     (handle-jump-to-end state ev)
 
-    :slider/drag-start
-    (assoc state :slider-dragging true)
-
-    :slider/drag-end
-    (assoc state :slider-dragging false)
-
-    :dropdown/interact-start
-    (assoc state :dropdown-interacting true)
-
-    :dropdown/interact-end
-    (assoc state :dropdown-interacting false)
-
-    :user/interacting
-    (assoc state :user-interacting (:interacting ev))
 
     :data/load-file
     (if-let [packets (:packets ev)]

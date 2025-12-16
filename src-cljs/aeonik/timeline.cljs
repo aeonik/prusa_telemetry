@@ -23,8 +23,6 @@
            (fn []
              (let [state @app-state]
                (when (and (:timeline-playing state)
-                          (not (:slider-dragging state))
-                          (not (:user-interacting state))
                           @current-time-range
                           @dispatch-callback)
                  (@dispatch-callback {:type :timeline/tick

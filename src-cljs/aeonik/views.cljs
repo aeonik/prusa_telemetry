@@ -1,15 +1,12 @@
 (ns aeonik.views
   (:require [aeonik.util :as u]
             [aeonik.events :refer [dispatch!]]
-            [aeonik.state :as state]
+            [aeonik.state :as state :refer [app-state]]
             [aeonik.files :as files]
-            [clojure.string :as str]
-            [reagent.core :as r]))
+            [clojure.string :as str]))
 
-(defn status-view [app-state]
-  (if (:connected app-state)
-    [:span {:class "connected"} "● Connected"]
-    [:span {:class "disconnected"} "● Disconnected"]))
+(defn status-view [_app-state]
+  [:span {:class "status"} "● Ready"])
 
 (defn latest-view [app-state]
   (let [latest-values (state/get-latest-values (:telemetry-events app-state))
@@ -27,7 +24,7 @@
          [:th "Time"]]]
        [:tbody
         (map (fn [metric]
-               [:tr
+               [:tr {:key (str (:sender metric) "/" (:name metric))}
                 [:td (:sender metric)]
                 [:td (:name metric)]
                 [:td (u/format-metric-value metric)]
@@ -41,30 +38,31 @@
   (let [packets (state/get-telemetry-packets (:telemetry-events app-state) packet-history-limit)]
     (if (empty? packets)
       [:div {:class "empty"} "Waiting for telemetry data..."]
-      (map (fn [packet]
-             (let [wall-time (:wall-time-str packet)
-                   sender (:sender packet)
-                   metrics (:metrics packet)]
-               [:div {:class "packet"}
-                [:div {:class "packet-header"}
-                 [:span {:class "time"} (or wall-time "--------")]
-                 [:span {:class "sender"} "From: " sender]
-                 [:span {:class "metric-count"} (str (count metrics)) " metrics"]]
-                (when (and metrics (> (count metrics) 0))
-                  [:table {:class "metrics"}
-                   [:thead
-                    [:tr
-                     [:th "Time"]
-                     [:th "Metric"]
-                     [:th "Value"]]]
-                   [:tbody
-                    (map (fn [metric]
-                           [:tr
-                            [:td (or (:device-time-str metric) "--------")]
-                            [:td (:name metric)]
-                            [:td (u/format-metric-value metric)]])
-                         metrics)]])]))
-          (reverse packets)))))
+      (map-indexed (fn [idx packet]
+                      (let [wall-time (:wall-time-str packet)
+                            sender (:sender packet)
+                            metrics (:metrics packet)]
+                        [:div {:key (str "packet-" idx "-" wall-time "-" sender)
+                              :class "packet"}
+                         [:div {:class "packet-header"}
+                          [:span {:class "time"} (or wall-time "--------")]
+                          [:span {:class "sender"} "From: " sender]
+                          [:span {:class "metric-count"} (str (count metrics)) " metrics"]]
+                         (when (and metrics (> (count metrics) 0))
+                           [:table {:class "metrics"}
+                            [:thead
+                             [:tr
+                              [:th "Time"]
+                              [:th "Metric"]
+                              [:th "Value"]]]
+                            [:tbody
+                             (map-indexed (fn [m-idx metric]
+                                           [:tr {:key (str "metric-" idx "-" m-idx "-" (:name metric))}
+                                            [:td (or (:device-time-str metric) "--------")]
+                                            [:td (:name metric)]
+                                            [:td (u/format-metric-value metric)]])
+                                         metrics)]])]))
+                    (reverse packets)))))
 
 ;; Timeline helper functions
 
@@ -86,7 +84,7 @@
    [:span " → "]
    [:span {:class "time-max"} (u/format-wall-time-ms (:max time-range))]])
 
-(defn- timeline-slider [time-range current-time _slider-dragging?]
+(defn- timeline-slider [time-range current-time]
   [:input {:type "range"
            :id "time-slider"
            :class "time-slider"
@@ -94,16 +92,8 @@
            :max (:max time-range)
            :value current-time
            :step 100
-           :onmousedown (fn [_]
-                         (dispatch! {:type :slider/drag-start})
-                         (dispatch! {:type :timeline/stop}))
-           :onmouseup (fn [_]
-                       (dispatch! {:type :slider/drag-end}))
-           :ontouchstart (fn [_]
-                          (dispatch! {:type :slider/drag-start})
-                          (dispatch! {:type :timeline/stop}))
-           :ontouchend (fn [_]
-                       (dispatch! {:type :slider/drag-end}))
+           :onmousedown #(dispatch! {:type :timeline/stop})
+           :ontouchstart #(dispatch! {:type :timeline/stop})
            :oninput (fn [e]
                      (let [new-time (js/parseInt (aget e "target" "value"))]
                        (dispatch! {:type :timeline/set-time :time new-time})))}])
@@ -153,12 +143,12 @@
                                     :time-range time-range})))}
     "⏩"]])
 
-(defn- timeline-scrubber [time-range current-time timeline-playing? slider-dragging?]
+(defn- timeline-scrubber [time-range current-time timeline-playing?]
   (when time-range
     [:div {:class "timeline-scrubber"}
      (timeline-time-range-display time-range)
      [:div {:class "slider-container"}
-      (timeline-slider time-range current-time slider-dragging?)
+      (timeline-slider time-range current-time)
       (timeline-time-display current-time time-range)]
      (timeline-buttons time-range timeline-playing?)]))
 
@@ -175,7 +165,7 @@
        [:th "Time"]]]
      [:tbody
       (map (fn [metric]
-             [:tr
+             [:tr {:key (str (:sender metric) "/" (:name metric))}
               [:td (:sender metric)]
               [:td (:name metric)]
               [:td (u/format-metric-value metric)]
@@ -183,79 +173,85 @@
               [:td (or (:device-time-str metric) "--------")]])
            sorted-metrics)]]))
 
-(defn- format-file-option-label [file-info]
-  "Format file info for display in dropdown"
-  (str (:date file-info) " - " (:filename file-info) " (" (.toFixed (/ (:size file-info) 1024) 1) " KB)"))
-
-(defn timeline-filename-selector [filenames current-filename available-files]
-  (let [filename-to-file-info (reduce (fn [acc file-info]
-                                        (assoc acc (:filename file-info) file-info))
-                                      {}
-                                      available-files)
-        loaded-options (map (fn [fname]
-                              [:option {:value fname} fname])
-                            filenames)
-        available-options (map (fn [file-info]
-                                 [:option {:value (str "file:" (:filename file-info))}
-                                  (format-file-option-label file-info)])
-                               available-files)
-        options (concat
-                 [[:option {:value ""} "-- Select a file --"]]
-                 loaded-options
-                 available-options)]
+(defn timeline-filename-selector [available-files]
+  "Simple dropdown to select and load a file"
+  (let [selected-value (or (:selected-filename @app-state) "")]
     [:div {:class "filename-selector"}
      [:label {:for "filename-select"} "Print File: "]
      [:select {:id "filename-select"
-               :value (or current-filename "")
-               :onmousedown (fn [_]
-                             (dispatch! {:type :dropdown/interact-start}))
-               :onblur (fn [_]
-                        (dispatch! {:type :dropdown/interact-end}))
-               :onchange (fn [e]
-                          (let [selected-value (aget e "target" "value")]
-                            (js/setTimeout
-                             (fn []
-                               (dispatch! {:type :dropdown/interact-end}))
-                             100)
-                            (if (str/starts-with? selected-value "file:")
-                              (let [actual-filename (subs selected-value 5)
-                                    file-info (get filename-to-file-info actual-filename)]
-                                (when file-info
-                                  (files/load-telemetry-file! (:date file-info) actual-filename)))
-                              (when (not= selected-value "")
-                                (dispatch! {:type :timeline/set-filename
-                                           :filename selected-value})))))}
-      options]]))
+               :value selected-value
+               :on-change (fn [e]
+                            (let [value (aget e "target" "value")]
+                              (when (not= value "")
+                                (let [file-info (first (filter #(= value (str (:date %) ":" (:filename %))) available-files))]
+                                  (when file-info
+                                    (dispatch! {:type :timeline/set-filename :filename value})
+                                    (files/load-telemetry-file (:date file-info) (:filename file-info)))))))}
+      [:option {:key "empty" :value ""} "-- Select a file --"]
+      (map (fn [file-info]
+             [:option {:key (str (:date file-info) "-" (:filename file-info))
+                       :value (str (:date file-info) ":" (:filename file-info))}
+              (str (:date file-info) " - " (:filename file-info) " (" (.toFixed (/ (:size file-info) 1024) 1) " KB)")])
+           available-files)]]))
 
-(defn timeline-view [app-state]
-  (let [timeline-data (state/get-timeline-data (:telemetry-events app-state))
-        filenames (keys timeline-data)
-        current-filename (or (:selected-filename app-state) (first filenames))
-        available-files (:available-files app-state)
-        all-metrics (get timeline-data current-filename [])
+(defn timeline-view []
+  "Simple timeline view - reactive to app-state"
+  (let [app-state-val @app-state
+        timeline-data (state/get-timeline-data (:telemetry-events app-state-val))
+        available-files (:available-files app-state-val)
+        selected-filename (:selected-filename app-state-val)
+        ;; Normalize selected-filename to match timeline-data keys, or use first available
+        timeline-filenames (keys timeline-data)
+        print-filename (or (when (and selected-filename (seq timeline-filenames))
+                            (let [normalize (fn [f]
+                                             (-> (str f)
+                                                 (str/replace #"^[\"']+" "")
+                                                 (str/replace #"[\"']+$" "")
+                                                 (str/trim)
+                                                 (str/replace #"^[^:]+:" "") ; Remove date: prefix if present
+                                                 (str/replace #"^_" "")
+                                                 (str/replace #"\.edn$" "")))
+                                  normalized-selected (normalize selected-filename)
+                                  matched (some #(when (= normalized-selected (normalize %)) %) timeline-filenames)]
+                              (when (not matched)
+                                (println "Warning: Could not match selected-filename" selected-filename
+                                         "to timeline-data keys:" timeline-filenames))
+                              matched))
+                          (first timeline-filenames))
+        all-metrics (get timeline-data print-filename [])
         time-range (compute-time-range all-metrics)
-        current-time (or (:selected-time app-state) (when time-range (:max time-range)))
-        metrics-at-time (if (and current-filename current-time)
-                         (u/get-metrics-at-time timeline-data current-filename current-time)
+        ;; Ensure current-time is within the valid range, defaulting to max
+        current-time (let [selected-time (:selected-time app-state-val)
+                           default-time (when time-range (:max time-range))]
+                       (cond
+                         (and selected-time time-range
+                              (>= selected-time (:min time-range))
+                              (<= selected-time (:max time-range)))
+                         selected-time
+                         default-time
+                         :else
+                         default-time))
+        ;; Update state if time is out of range
+        _ (when (and time-range current-time
+                    (not= current-time (:selected-time app-state-val)))
+            (js/setTimeout #(dispatch! {:type :timeline/set-time :time current-time}) 0))
+        metrics-at-time (if (and print-filename current-time time-range
+                                (>= current-time (:min time-range))
+                                (<= current-time (:max time-range)))
+                         (u/get-metrics-at-time timeline-data print-filename current-time)
                          [])
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-time)]
-    (r/use-effect
-     (fn []
-       (when (empty? available-files)
-         (files/fetch-available-files!))
-       js/undefined)
-     #js [])
     [:div {:class "timeline-view"}
      [:div {:class "timeline-controls"}
-      (timeline-filename-selector filenames current-filename available-files)
-      (timeline-scrubber time-range current-time (:timeline-playing app-state) (:slider-dragging app-state))]
+      (timeline-filename-selector available-files)
+      (timeline-scrubber time-range current-time (:timeline-playing app-state-val))]
      (timeline-metrics-table sorted-metrics)]))
 
 (defn main-view [app-state]
   (case (:view-mode app-state)
     :latest  (latest-view app-state)
     :packets (packets-view app-state)
-    :timeline (timeline-view app-state)
+    :timeline (timeline-view)
     (latest-view app-state)))
 
 (defn view-toggle-label

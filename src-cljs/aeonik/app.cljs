@@ -1,9 +1,10 @@
 (ns aeonik.app
   (:require [aeonik.events :refer [dispatch! init-timeline!]]
+            [aeonik.files :as files]
             [aeonik.state :refer [app-state load-state-from-storage!] :as state]
             [aeonik.views :as views]
             [aeonik.ws :as ws]
-            [reagent.dom :as rdom]))
+            [reagent.dom.client :as rdom]))
 
 (defn set-view-mode
   "Parameters: mode keyword or string representing a view.
@@ -19,12 +20,15 @@
   (let [state-val @app-state]
     [views/app-shell state-val (.-pathname js/location)]))
 
+(defonce root (when-let [el (.getElementById js/document "app")]
+                 (rdom/create-root el)))
+
 (defn- mount-root!
   "Parameters: none.
    Returns: nil after mounting the Reagent root."
   []
-  (when-let [root-el (.getElementById js/document "app")]
-    (rdom/render [root-component] root-el)))
+  (when root
+    (rdom/render root [root-component])))
 
 (defn- ensure-timeline-selection!
   "Parameters: none.
@@ -54,6 +58,8 @@
   (ensure-timeline-selection!)
   (init-timeline!)
   (ws/connect-websocket!)
+  ;; Fetch available files on initialization
+  (files/fetch-available-files!)
   (when (= (.-pathname js/location) "/timeline")
     (dispatch! {:type :view/set :mode :timeline}))
   (mount-root!))
