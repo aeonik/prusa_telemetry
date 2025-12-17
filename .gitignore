@@ -19,6 +19,8 @@
 .settings
 .socket-repl-port
 .sw*
+.shadow-cljs/
+telemetry-data/
 .vscode
 *.class
 *.jar
