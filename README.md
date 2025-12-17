@@ -147,7 +147,7 @@ clj -M:run-m 8514
 ### Run Tests
 
 ```bash
-clojure -T:build test
+clojure -X:test/run
 ```
 
 ### Build Uberjar
