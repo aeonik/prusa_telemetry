@@ -60,14 +60,14 @@
 (def prelude-re #"(?:^|\s)msg=\d+,\s*tm=\d+,\s*v=\d+")
 
 (defn parse-prelude
-  "Extract msg, tm, and v from the prelude string"
+  "Extract msg, tm (base-time-us), and v from the prelude string"
   [s]
   (->> (str/split (or s "") #",")
        (map #(str/split % #"=" 2))
        (reduce (fn [m [k v]]
                  (case k
                    "msg" (assoc m :msg (parse-long? v))
-                   "tm"  (assoc m :tm  (parse-long? v))
+                   "tm"  (assoc m :base-time-us (parse-long? v))  ; base time in microseconds
                    "v"   (assoc m :v   (parse-long? v))
                    m))
                {})))
@@ -80,41 +80,47 @@
         name   (first tokens)]
     (when (seq name)
       (cond
-        ;; Simple numeric: name v=<value> <tick>
+        ;; Simple numeric: name v=<value> <offset-ms>
         (and (>= (count tokens) 3)
              (str/starts-with? (second tokens) "v="))
         (let [val-str (subs (second tokens) 2)
               val     (parse-value val-str)
-              tick    (parse-long? (nth tokens 2))
-              ts      (when (and tick base-tm-us)
-                        (+ base-tm-us (* tick 1000)))]
+              offset-ms (parse-long? (nth tokens 2))
+              ts      (when (and offset-ms base-tm-us)
+                        (+ base-tm-us (* offset-ms 1000)))]
           {:type :numeric
            :name name
            :value val
-           :tick tick
+           :offset-ms offset-ms
            :device-time-us ts})
-        ;; Error message: name error="..." <tick>
+        ;; Error message: name error="..." <offset-ms>
         (and (>= (count tokens) 3)
              (str/starts-with? (second tokens) "error="))
         (let [[_ msg] (re-find #"error=\"([^\"]*)\"" line)
-              tick    (parse-long? (last tokens))
-              ts      (when (and tick base-tm-us)
-                        (+ base-tm-us (* tick 1000)))]
+              offset-ms (parse-long? (last tokens))
+              ts      (when (and offset-ms base-tm-us)
+                        (+ base-tm-us (* offset-ms 1000)))]
           {:type :error
            :name name
            :error (or msg "")
-           :tick tick
+           :offset-ms offset-ms
            :device-time-us ts})
-        ;; Structured fields: name k=v[,k=v,...] <tick>
+        ;; Structured fields: name k=v[,k=v,...] <offset-ms>
+        ;; Payload may span multiple tokens (e.g., quoted strings with spaces)
+        ;; offset-ms is always the last token
+        ;; Payload is everything between name and offset-ms
         (>= (count tokens) 3)
-        (let [tick   (parse-long? (last tokens))
-              fields (parse-kv-pairs (second tokens))
-              ts     (when (and tick base-tm-us)
-                       (+ base-tm-us (* tick 1000)))]
+        (let [offset-ms (parse-long? (last tokens))
+              ;; Join tokens 1..(n-2) with spaces to reconstruct full payload
+              ;; (skip first token which is name, skip last token which is offset-ms)
+              payload (str/join " " (drop 1 (drop-last 1 tokens)))
+              fields (parse-kv-pairs payload)
+              ts     (when (and offset-ms base-tm-us)
+                       (+ base-tm-us (* offset-ms 1000)))]
           {:type :structured
            :name name
            :fields fields
-           :tick tick
+           :offset-ms offset-ms
            :device-time-us ts})
         ;; Fallback for unknown format
         :else
@@ -135,7 +141,7 @@
           prelude-match (re-find prelude-re first-line)
           prelude-str   (when prelude-match (str/trim prelude-match))
           prelude       (parse-prelude prelude-str)
-          base-tm-us    (:tm prelude)
+          base-tm-us    (:base-time-us prelude)
           ;; Parse metrics (skip first line and empty lines)
           metrics (->> (rest lines)
                        (remove str/blank?)
@@ -203,24 +209,160 @@
                                      value-str)))
                          formatted-metrics))))))
 
+;; ---- Packet unwrapping for time-ordered metric stream ----
+
+(defn packet-id
+  "Generate a stable packet identifier from packet metadata.
+   Returns [msg-id sender-str received-at-ms]"
+  [{:keys [sender received-at prelude]}]
+  [(:msg prelude) (str sender) (.getTime received-at)])
+
+(defn unwrap-packet
+  "Unwrap a packet into individual metrics with packet provenance.
+   Each metric gets:
+   - :packet-id - stable packet identifier
+   - :packet-sender - sender from packet
+   - :packet-received-at - when packet was received
+   - :packet-prelude - packet prelude metadata
+   - :idx - index within packet
+   - :offset-ms - offset in milliseconds relative to packet base-time
+   - :device-time-us - absolute device time in microseconds
+   
+   NOTE: This version duplicates packet metadata. For better memory efficiency,
+   use unwrap-packet-lite and rely on packet-registry for metadata."
+  [{:keys [prelude metrics sender received-at] :as pkt}]
+  (let [pid   (packet-id pkt)
+        base-time-us (:base-time-us prelude)]
+    (map-indexed
+     (fn [idx m]
+       (let [offset-ms (:offset-ms m)
+             device-us (when (and offset-ms base-time-us)
+                        (+ base-time-us (* 1000 (long offset-ms))))]
+         (-> m
+             (assoc :packet-id pid
+                    :packet-sender sender
+                    :packet-received-at received-at
+                    :packet-prelude prelude
+                    :idx idx
+                    :offset-ms offset-ms
+                    :device-time-us device-us))))
+     metrics)))
+
+(defn unwrap-packet-lite
+  "Unwrap a packet into individual metrics with minimal packet provenance.
+   Each metric gets only:
+   - :packet-id - stable packet identifier (use packet-registry for full metadata)
+   - :idx - index within packet
+   - :offset-ms - offset in milliseconds relative to packet base-time (for reference)
+   - :device-time-us - absolute device time in microseconds
+   
+   Removes :offset-ms from input (re-adds it with clearer name).
+   Packet metadata (sender, received-at, prelude) should be stored in
+   a separate packet-registry keyed by :packet-id."
+  [{:keys [prelude metrics] :as pkt}]
+  (let [pid   (packet-id pkt)
+        base-time-us (:base-time-us prelude)]
+    (map-indexed
+     (fn [idx m]
+       (let [offset-ms (:offset-ms m)
+             device-us (when (and offset-ms base-time-us)
+                        (+ base-time-us (* 1000 (long offset-ms))))]
+         (-> m
+             (assoc :packet-id pid
+                    :idx idx
+                    :offset-ms offset-ms
+                    :device-time-us device-us))))
+     metrics)))
+
+(defn create-metric-stream
+  "Create a time-ordered stream of unwrapped metrics from a packet stream/bus.
+   Buffers the last N packets (default 2) to handle metrics that occur before
+   the packet's base-time (negative offsets).
+   
+   Returns a stream that emits metrics sorted by device-time-us.
+   Each metric includes packet provenance via :packet-id (use packet-registry
+   for full packet metadata).
+   
+   If packet-stream is a bus, subscribes to it to ensure proper broadcast behavior.
+   
+   Strategy:
+   - Buffer packets (allow buffer to grow beyond buffer-size temporarily)
+   - Maintain sorted list of unwrapped metrics from buffered packets
+   - When buffer count > buffer-size and a new packet arrives:
+     1. Unwrap new packet and merge with existing metrics
+     2. Sort all metrics by device-time-us
+     3. Emit metrics from the oldest packet (safe since no future packets can be earlier)
+     4. Remove oldest packet from buffer AND its metrics from unwrapped list
+   - Only drop packets when emitting (never drop on insert)"
+  ([packet-stream]
+   (create-metric-stream packet-stream 2))
+  ([packet-stream buffer-size]
+   (let [metric-stream (s/stream 100)
+         packet-buffer (atom [])
+         unwrapped-metrics (atom [])
+         ;; Create a subscription stream and connect it to the bus
+         ;; This ensures each consumer gets their own copy of all messages
+         subscription-stream (s/stream 100)]
+     ;; Connect bus to subscription stream (broadcasts to this consumer)
+     (s/connect packet-stream subscription-stream)
+     (s/consume
+      (fn [packet]
+        (when-not (:error packet)
+          ;; Add packet to buffer (don't drop on insert)
+          (swap! packet-buffer conj packet)
+          
+          ;; Unwrap new packet and add to metrics
+          (let [new-metrics (unwrap-packet-lite packet)
+                all-metrics (swap! unwrapped-metrics
+                                   (fn [existing]
+                                     (->> (concat existing new-metrics)
+                                          (filter :device-time-us)
+                                          (sort-by :device-time-us))))
+                buffer-count (count @packet-buffer)]
+            
+            ;; If buffer exceeds size, emit metrics from oldest packet
+            (when (> buffer-count buffer-size)
+              (let [oldest-packet (first @packet-buffer)
+                    oldest-packet-id (packet-id oldest-packet)
+                    metrics-to-emit (filter #(= (:packet-id %) oldest-packet-id) all-metrics)
+                    remaining-metrics (filter #(not= (:packet-id %) oldest-packet-id) all-metrics)]
+                
+                ;; Emit metrics from oldest packet
+                (doseq [metric metrics-to-emit]
+                  (s/put! metric-stream metric))
+                
+                ;; Remove oldest packet from buffer (only drop when emitting)
+                (swap! packet-buffer (fn [buf] (vec (rest buf))))
+                ;; Remove oldest packet's metrics from unwrapped list
+                (reset! unwrapped-metrics remaining-metrics))))))
+      subscription-stream)
+     metric-stream)))
+
 ;; ---- Server management ----
 
 (defn start-telemetry-server
   "Start a UDP telemetry server with transducer pipeline.
    Returns {:socket .. :stream .. :processed .. :stop! (fn [])}
    Options:
-   - :port (default 8514)"
-  [{:keys [port]
-    :or {port 8514}}]
+   - :port (default 8514)
+   - :processed-buffer-size (default 200000) - Buffer size for processed stream
+     (large default to handle days-long prints before archiving)
+   
+   Returns source streams. Each consumer should create their own stream
+   and connect it to the source using s/connect to get their own copy of messages."
+  [{:keys [port processed-buffer-size]
+    :or {port 8514
+         processed-buffer-size 200000}}]
   (let [socket @(udp/socket {:port port})
-        ;; Raw parsed stream
+        ;; Parsed stream (source)
         parsed-stream (s/stream 100)
-        ;; Processed stream with transducers
-        processed-stream (s/stream 100 (comp sort-metrics-xf
-                                             add-formatted-time-xf
-                                             format-for-display-xf))]
+        ;; Processed stream with transducers (source)
+        ;; Large buffer to handle days-long prints before archiving
+        processed-stream (s/stream processed-buffer-size (comp sort-metrics-xf
+                                                                add-formatted-time-xf
+                                                                format-for-display-xf))]
 
-    ;; Connect socket -> parsed
+    ;; Connect socket -> parsed stream
     (s/connect-via
      socket
      (fn [msg]
@@ -235,8 +377,8 @@
     (s/on-drained parsed-stream #(s/close! socket))
 
     {:socket socket
-     :stream parsed-stream
-     :processed processed-stream
+     :stream parsed-stream    ; Source stream - consumers create subscription streams and connect
+     :processed processed-stream ; Source stream - consumers create subscription streams and connect
      :stop!  (fn []
                (s/close! processed-stream)
                (s/close! parsed-stream)

@@ -81,23 +81,41 @@ UDP Packet (Raw Text)
     ↓
 parse-packet (parse-prelude, parse-metric-line)
     ↓
-[parsed-stream] (Manifold stream)
+[parsed-stream] (Manifold stream, buffer: 100 items)
     ↓
 Transducer Pipeline:
   - sort-metrics-xf (sort by device-time-us)
   - add-formatted-time-xf (add formatted timestamps)
   - format-for-display-xf (create display lines)
     ↓
-[processed-stream] (Manifold stream)
+[processed-stream] (Manifold stream, buffer: 200,000 items default, configurable)
     ↓
-    ├─→ [Single Consumer] handle-packet-saving!
-    │   ├─→ Detect print_filename
-    │   ├─→ Track active prints (sticky, 10min timeout)
-    │   └─→ save-packet-to-file! (append-only EDN)
+    ├─→ [saving-stream] (buffer: 100 items)
+    │   └─→ [Single Consumer] handle-packet-saving!
+    │       ├─→ Detect print_filename
+    │       ├─→ Track active prints (sticky, 10min timeout)
+    │       └─→ save-packet-to-file! (append-only EDN)
+    │
+    ├─→ [tap-parsed] (buffer: 100 items, for REPL inspection)
+    │   └─→ [packet-buffer-parsed] (max 100 packets)
+    │
+    ├─→ [tap-processed] (buffer: 100 items, for REPL inspection)
+    │   └─→ [packet-buffer-processed] (max 100 packets)
     │
     └─→ [WebSocket Handler] (per client)
+        ├─→ [client-stream] (buffer: 100 items per client)
         ├─→ telemetry-to-json (convert to JSON)
         └─→ Stream to browser via WebSocket
+
+Alternative: Metric Stream (time-ordered metrics)
+[parsed-stream] → [subscription-stream] (buffer: 100 items)
+    ↓
+[create-metric-stream] (packet buffer: 2 packets, allows growth)
+    ↓
+[metric-stream] (buffer: 100 items)
+    ↓
+    ├─→ [metric-buffer] (max 100 metrics, for REPL inspection)
+    └─→ Time-ordered metric consumers
 #+END_SRC
 
 ** Frontend Data Flow
@@ -107,25 +125,47 @@ WebSocket Message (JSON)
     ↓
 ws/parse-ws-message
     ↓
-events/create-events (one event per metric)
-    ↓
 events/handle-ws-message
-    ├─→ Extract print_filename
-    ├─→ Create event records with wall-time-ms
-    └─→ Append to :telemetry-events (sorted by time)
+    ├─→ Extract print_filename, packet-msg, received-at
+    ├─→ events/create-events (one event per metric)
+    ├─→ Sort events by device-time-us
+    └─→ merge-sorted-events (O(n+m) merge into :telemetry-events)
     ↓
 state/app-state (atom)
     ↓
     ├─→ state/get-latest-values (derived view)
-    │   └─→ Latest View
+    │   └→ Latest View
     │
     ├─→ state/get-telemetry-packets (derived view)
-    │   └─→ Packets View
+    │   └→ Packets View (grouped by sender/wall-time-str)
     │
-    └─→ state/get-timeline-data (derived view)
-        └─→ Timeline View
-            ├─→ Timeline scrubbing
-            └─→ Timeline playback
+    └─→ state/get-timeline-data (derived view, cached)
+        └→ Timeline View
+            ├─→ Groups by print_filename
+            ├─→ Groups packets by packet-msg
+            ├─→ Timeline scrubbing (by packet msg number)
+            └─→ Timeline playback (steps by packet msg)
+
+File Loading Flow:
+files/fetch-available-files!
+    ↓
+GET /api/telemetry-files
+    ↓
+events/:files/set-available
+    ↓
+User selects file
+    ↓
+files/load-telemetry-file
+    ↓
+GET /api/telemetry-file/<date>/<filename>
+    ↓
+events/:data/load-file
+    ↓
+events/load-telemetry-packets (batched for large files)
+    ↓
+events/packets-to-events
+    ↓
+merge-sorted-events into :telemetry-events
 #+END_SRC
 
 ** State Persistence Flow
@@ -138,17 +178,17 @@ add-watch on app-state
 schedule-save! (debounced, 1 second)
     ↓
 save-state-to-storage!
-    ├─→ Extract persistable state
-    ├─→ Check size (4MB limit)
-    ├─→ Reduce events if needed (keep last 10k)
-    └─→ Save to localStorage (JSON)
+    ├─→ Extract persistable state (:selected-time, :selected-filename, :view-mode)
+    └─→ Save to localStorage (JSON, small UI preferences only)
     ↓
 Page Refresh
     ↓
 load-state-from-storage!
     ├─→ Load from localStorage
     ├─→ Merge with defaults
-    └─→ Restore :telemetry-events
+    └─→ Restore UI preferences (NOT :telemetry-events)
+
+Note: :telemetry-events are NOT persisted. They must be reloaded from server files.
 #+END_SRC
 
 * Component Details
@@ -162,6 +202,8 @@ Core telemetry parsing and processing.
 **** Key Functions
 
 - =start-telemetry-server= :: Creates UDP socket and stream pipeline
+  - Options: =:port= (default 8514), =:processed-buffer-size= (default 200000)
+  - Large processed buffer default handles days-long prints before archiving
 - =parse-packet= :: Parses raw UDP message into structured data
 - =parse-metric-line= :: Parses individual metric lines (numeric, error, structured)
 - =parse-value= :: Tolerant value parsing (long, double, string)
@@ -175,8 +217,11 @@ Core telemetry parsing and processing.
 **** Streams
 
 - =socket= :: Raw UDP socket (aleph.udp)
-- =parsed-stream= :: Parsed packets (before transducers)
-- =processed-stream= :: Fully processed packets (after transducers)
+- =parsed-stream= :: Parsed packets (before transducers, buffer: 100 items)
+- =processed-stream= :: Fully processed packets (after transducers, buffer: 200,000 items default, configurable)
+  - Large buffer prevents packet loss during days-long prints
+  - Configurable via =:processed-buffer-size= option
+- =create-metric-stream= :: Creates time-ordered metric stream (packet buffer: 2 packets, metric stream buffer: 100 items)
 
 *** aeonik.web-server
 
@@ -198,6 +243,11 @@ HTTP/WebSocket server and file persistence.
 - =set-active-print-filename!= :: Updates active print tracking
 - =get-print-filename= :: Extracts print_filename from metrics
 
+**** Streams
+
+- =saving-stream= :: Subscription stream for packet saving (buffer: 100 items)
+- =client-stream= :: Per-WebSocket-client subscription stream (buffer: 100 items per client)
+
 **** File Persistence
 
 - Directory structure: =telemetry-data/prints/YYYY-MM-DD/<sanitized-filename>.edn=
@@ -213,10 +263,12 @@ Application entry point and initialization.
 **** Key Functions
 
 - =init= :: Main initialization function
-  - Loads state from localStorage
-  - Sets up timeline selection if data exists
+  - Loads UI preferences from localStorage
+  - Ensures timeline selection is set (if data exists)
+  - Initializes timeline module
   - Connects WebSocket
-  - Configures UI controls
+  - Fetches available telemetry files from server
+  - Sets view mode to :timeline if on /timeline path
   - Performs initial render
 
 - =set-view-mode= :: Called from timeline.html to set view mode
@@ -228,31 +280,31 @@ Central state management and persistence.
 **** State Structure
 
 #+BEGIN_SRC clojure
-{:ws                 nil          ; WebSocket connection
- :connected          false        ; Connection status
- :telemetry-events   []           ; Single vector of all events (sorted by time)
- :paused             false        ; Pause data ingestion
+{:telemetry-events   []           ; Single vector of all events (sorted by device-time-us)
+ :available-files    []           ; Available telemetry files from disk
  :view-mode          :latest      ; :latest | :packets | :timeline
- :selected-time      nil          ; Selected time for scrubbing (ms)
- :selected-filename  nil          ; Selected print filename
- :timeline-playing   false        ; Timeline playback active
- :timeline-interval  nil          ; Interval ID for playback
- :slider-dragging    false        ; User dragging timeline slider
- :user-interacting   false}       ; User interaction flag
+ :selected-packet-msg nil         ; Selected packet msg number for timeline scrubbing
+ :selected-filename  nil          ; Selected file identifier (format: "date:filename")
+ :timeline-playing   false}       ; Timeline auto-play state
 #+END_SRC
+
+Note: WebSocket connection and other transient state are not stored in app-state.
 
 **** Derived View Functions
 
 - =get-latest-values= :: Latest value for each sender/metric pair
-- =get-timeline-data= :: Grouped by print_filename, sorted by time
-- =get-telemetry-packets= :: Packets grouped by sender/time, limited count
+- =get-timeline-data= :: Grouped by print_filename, packets grouped by packet-msg, sorted by device-time-us
+- =get-telemetry-packets= :: Packets grouped by sender/wall-time-str, limited count
+
+Note: Timeline data uses cached atom that updates only when :telemetry-events changes.
 
 **** Persistence
 
-- =save-state-to-storage!= :: Saves to localStorage (debounced, 1 second)
-- =load-state-from-storage!= :: Loads from localStorage on init
-- Size limit: 4MB (reduces to last 10k events if exceeded)
-- Persisted keys: =:telemetry-events, :selected-time, :selected-filename, :view-mode, :paused=
+- =save-state-to-storage!= :: Saves UI preferences to localStorage (debounced, 1 second)
+- =load-state-from-storage!= :: Loads UI preferences from localStorage on init
+- Persisted keys: =:selected-time, :selected-filename, :view-mode=
+- Note: =:telemetry-events= are NOT persisted (must be loaded from server files)
+- Note: =:selected-time= is legacy/unused; timeline uses =:selected-packet-msg= instead
 
 *** aeonik.events
 
@@ -265,20 +317,20 @@ Event dispatch and state transformations.
 - =:ws/message= :: WebSocket message received
 - =:view/set= :: Set view mode
 - =:view/set-cycle= :: Cycle through view modes
-- =:pause/toggle= :: Toggle pause state
+- =:pause/toggle= :: Toggle pause state (legacy/unused)
 - =:data/clear= :: Clear all telemetry events
+- =:data/load-file= :: Load telemetry packets from file
 - =:timeline/set-filename= :: Set selected print filename
-- =:timeline/set-time= :: Set selected time
+- =:timeline/set-packet-msg= :: Set selected packet msg number for scrubbing
 - =:timeline/play= :: Start timeline playback
 - =:timeline/stop= :: Stop timeline playback
-- =:timeline/tick= :: Timeline playback tick
-- =:timeline/step-forward= :: Step forward 1 second
-- =:timeline/step-backward= :: Step backward 1 second
-- =:timeline/jump-to-start= :: Jump to start of timeline
-- =:timeline/jump-to-end= :: Jump to end of timeline
-- =:slider/drag-start= :: Timeline slider drag started
-- =:slider/drag-end= :: Timeline slider drag ended
-- =:user/interacting= :: User interaction flag
+- =:timeline/tick= :: Timeline playback tick (steps by packet msg)
+- =:timeline/step-forward= :: Step forward 1 packet
+- =:timeline/step-backward= :: Step backward 1 packet
+- =:timeline/jump-to-start= :: Jump to start of timeline (min packet msg)
+- =:timeline/jump-to-end= :: Jump to end of timeline (max packet msg)
+- =:files/set-available= :: Set available telemetry files list
+- =:files/fetch-available= :: Trigger fetch of available files (side effect)
 
 **** Key Functions
 
@@ -286,10 +338,13 @@ Event dispatch and state transformations.
 - =handle-event= :: Pure function for state transformations
 - =handle-ws-message= :: Processes WebSocket messages
   - Creates event records (one per metric)
-  - Appends to :telemetry-events (maintains sort order)
+  - Appends to :telemetry-events (maintains sort order using merge-sorted-events)
   - Ensures timeline selection is set
-- =create-events= :: Creates event records from metrics
+- =create-events= :: Creates event records from metrics (includes packet-msg, received-at)
 - =ensure-timeline-selection= :: Sets default timeline selection if missing
+- =load-telemetry-packets= :: Loads packets from file (processes in batches for large files)
+- =packets-to-events= :: Converts packets to event records
+- =merge-sorted-events= :: Efficiently merges two sorted event vectors (O(n+m))
 
 *** aeonik.ws
 
@@ -300,10 +355,12 @@ WebSocket connection management.
 - =connect-websocket!= :: Establishes WebSocket connection
   - Uses relative URL (/ws) - shadow-cljs proxies to backend automatically
   - Sets up event handlers (onopen, onclose, onerror, onmessage)
+  - Stores socket in app-state :ws (not persisted)
 - =parse-ws-message= :: Parses JSON message from server
-  - Extracts sender, metrics, wall-time-str
+  - Extracts sender, metrics, wall-time-str, prelude, received-at
   - Extracts print_filename from metrics
   - Converts to Clojure data structures
+  - Returns event map with :type :ws/message
 
 *** aeonik.views
 
@@ -322,10 +379,11 @@ Timeline playback loop management.
 
 **** Key Functions
 
-- =set-dispatch-callback!= :: Sets callback for timeline events
-- =start-loop!= :: Starts playback loop (100ms interval)
+- =set-dispatch-callback!= :: Sets callback for timeline events (called from events namespace)
+- =start-loop!= :: Starts playback loop (100ms interval, steps by packet msg)
 - =stop-loop!= :: Stops playback loop
 - =update-loop!= :: Updates loop based on state changes
+- =compute-packet-range= :: Computes min/max packet msg numbers from timeline data
 
 **** State Watcher
 
@@ -334,7 +392,7 @@ Watches =app-state= for changes to:
 - =:selected-filename=
 - =:telemetry-events=
 
-Automatically starts/stops loop based on state.
+Automatically starts/stops loop based on state. Loop dispatches =:timeline/tick= events.
 
 *** aeonik.util
 
@@ -346,17 +404,20 @@ Utility functions for formatting and parsing.
 - =format-time= :: Formats device time (MM:SS.mmm)
 - =parse-wall-time-str= :: Parses wall-time string (HH:mm:ss.SSS) to milliseconds
 - =format-wall-time-ms= :: Formats milliseconds to wall-time string
-- =get-metrics-at-time= :: Gets latest metrics at or before given time
+- =get-metrics-at-packet= :: Gets metrics at selected packet msg number
 - =pad-number= :: Pads number with leading zeros
 
-*** aeonik.render
+*** aeonik.files
 
-DOM rendering and updates.
+File loading and management.
 
 **** Key Functions
 
-- =render!= :: Main render function (dispatches to view functions)
-- =update-timeline-display-only!= :: Updates timeline display without full render
+- =fetch-available-files!= :: Fetches list of available telemetry files from server
+- =load-telemetry-file= :: Loads telemetry file from server and dispatches :data/load-file event
+- =get-api-base-url= :: Gets base URL for API calls (uses relative URLs)
+
+Note: aeonik.render namespace does not exist. Rendering is handled directly by Reagent components in aeonik.views.
 
 * Data Structures
 
@@ -390,11 +451,13 @@ DOM rendering and updates.
  :fields          <map>              ; Structured fields
  :error           <string>           ; Error message
  :type            <keyword>           ; :numeric | :error | :structured
- :tick            <int>              ; Tick offset
+ :tick            <int>              ; Tick offset (from metric)
  :device-time-us  <int>              ; Device time (microseconds)
  :device-time-str "MM:SS.mmm"        ; Formatted device time
  :wall-time-str   "HH:mm:ss.SSS"     ; Wall time string
  :wall-time-ms    <int>              ; Wall time (milliseconds since midnight)
+ :packet-msg      <int>              ; Packet message number (for timeline navigation)
+ :received-at     <long>             ; Timestamp when packet was received (ms)
  :print-filename  <string>}          ; Associated print filename
 #+END_SRC
 
@@ -406,14 +469,15 @@ DOM rendering and updates.
  :prelude       {:msg <int> :tm <int> :v <int>}
  :metrics       [{:name <string>
                   :type <string>   ; "numeric" | "error" | "structured"
-                  :tick <int>
+                  :offset-ms <int> ; Tick offset in milliseconds
+                  :tick-ms <int>   ; Compatibility alias (same as offset-ms)
                   :device-time-us <int>
                   :device-time-str <string>
-                  :value <any>      ; Optional
-                  :error <string>   ; Optional
-                  :fields <map>}    ; Optional
- :display-lines [<string>]
- :wall-time-str <string>}
+                  :value <any>      ; Optional (for numeric type)
+                  :error <string>   ; Optional (for error type)
+                  :fields <map>}    ; Optional (for structured type)
+ :display-lines [<string>]          ; Formatted display lines
+ :wall-time-str <string>}           ; Formatted wall time
 #+END_SRC
 
 * Key Concepts
@@ -421,9 +485,11 @@ DOM rendering and updates.
 ** Single Source of Truth
 
 The frontend uses a single =:telemetry-events= vector as the source of truth. All views are derived from this vector using pure functions:
-- =get-latest-values= :: Groups by sender/name, takes latest
-- =get-timeline-data= :: Groups by print_filename, sorts by time
-- =get-telemetry-packets= :: Groups by sender/time, limits count
+- =get-latest-values= :: Groups by sender/name, takes latest (sorted by device-time-us)
+- =get-timeline-data= :: Groups by print_filename, then by packet-msg, sorts events by device-time-us
+- =get-telemetry-packets= :: Groups by sender/wall-time-str, limits count
+
+Timeline data is cached in an atom that updates only when :telemetry-events changes.
 
 ** Stream Processing
 
@@ -443,19 +509,22 @@ The backend tracks active prints using a "sticky" mechanism:
 
 ** State Persistence
 
-Frontend persists state to localStorage:
+Frontend persists UI preferences to localStorage:
 - Debounced saves (1 second delay)
-- Size limit: 4MB (reduces to last 10k events if exceeded)
-- Only persists essential state (excludes WebSocket, intervals)
-- Automatically loads on page refresh
+- Only persists: =:selected-time=, =:selected-filename=, =:view-mode=
+- =:telemetry-events= are NOT persisted (must reload from server files)
+- Automatically loads UI preferences on page refresh
+- Large files are loaded in batches (100 packets) to avoid blocking UI
 
 ** Timeline Playback
 
 Timeline playback uses a JavaScript interval:
 - 100ms steps (10 updates per second)
+- Steps by packet msg number (not time-based)
 - Automatically starts/stops based on state
-- Pauses during user interaction (slider dragging)
+- Stops when user interacts with slider
 - Watches state changes to update loop
+- Computes packet range (min/max msg) from timeline data
 
 * File Structure
 
@@ -471,10 +540,10 @@ Timeline playback uses a JavaScript interval:
 - =src-cljs/aeonik/state.cljs= :: State management, persistence
 - =src-cljs/aeonik/events.cljs= :: Event dispatch, handlers
 - =src-cljs/aeonik/ws.cljs= :: WebSocket connection
-- =src-cljs/aeonik/views.cljs= :: View rendering
-- =src-cljs/aeonik/render.cljs= :: DOM rendering
+- =src-cljs/aeonik/views.cljs= :: View rendering (Reagent components)
 - =src-cljs/aeonik/timeline.cljs= :: Timeline playback loop
 - =src-cljs/aeonik/util.cljs= :: Utility functions
+- =src-cljs/aeonik/files.cljs= :: File loading and management
 
 ** Configuration Files
 
@@ -494,6 +563,7 @@ Timeline playback uses a JavaScript interval:
 ;; In REPL (dev/user.clj auto-starts on REPL connection)
 (user/start!)                    ; Start all services
 (user/start-telemetry!)          ; Start telemetry server only
+(user/start-telemetry! {:port 8514 :processed-buffer-size 500000})  ; Custom buffer size
 (user/start-web!)                ; Start web server only
 (user/restart!)                   ; Restart all services
 (user/status)                     ; Check service status
@@ -517,28 +587,83 @@ Timeline playback uses a JavaScript interval:
 - Duplicate file writes: Fixed by single consumer pattern
 - State not persisting: Check localStorage size limit (4MB)
 
+* Buffer Configuration
+
+** Manifold Stream Buffers
+
+Most Manifold streams use 100-item buffers to handle backpressure:
+
+- =parsed-stream= :: 100 items (raw parsed packets)
+- =processed-stream= :: 200,000 items (after transducer pipeline, configurable via :processed-buffer-size)
+  - Large default to handle days-long prints before archiving
+  - Can be configured when starting telemetry server
+- =metric-stream= :: 100 items (unwrapped, time-ordered metrics)
+- =subscription-stream= :: 100 items (per metric-stream consumer)
+- =client-stream= :: 100 items (per WebSocket client)
+- =saving-stream= :: 100 items (for packet file persistence)
+- =tap-parsed= :: 100 items (for REPL inspection)
+- =tap-processed= :: 100 items (for REPL inspection)
+
+** In-Memory Inspection Buffers
+
+REPL inspection buffers (in =dev/user.clj=) maintain recent data:
+
+- =packet-buffer-parsed= :: Max 100 packets (drops oldest when full)
+- =packet-buffer-processed= :: Max 100 packets (drops oldest when full)
+- =metric-buffer= :: Max 100 metrics (drops oldest when full)
+- =packet-registry= :: Unbounded (maps packet-id to packet metadata)
+
+** Metric Stream Packet Buffer
+
+The metric stream uses a packet buffer for time-ordering:
+
+- =packet-buffer= :: Default 2 packets (configurable)
+  - Allows temporary growth beyond buffer-size
+  - Only drops packets when emitting (never on insert)
+  - Handles metrics with negative time offsets
+
+** Buffer Size Summary
+
+- **Stream buffers**: 
+  - Most streams: 100 items each
+  - processed-stream: 200,000 items (default, configurable via :processed-buffer-size)
+  - Total: ~200,800 items capacity (dominated by processed-stream)
+- **Inspection buffers**: 100 items each (3 buffers = 300 total capacity)
+- **Packet registry**: Unbounded (grows with unique packets)
+- **Metric stream packet buffer**: 2 packets (default, configurable)
+
+Note: The processed-stream buffer is intentionally large to handle days-long prints. 
+At ~2 seconds per packet, 200,000 items can buffer ~4.6 days of continuous printing.
+
 * Performance Considerations
 
 ** Backend
 
-- Stream buffering: 100-item buffers for parsed/processed streams
+- Stream buffering: 
+  - Most streams: 100-item buffers
+  - processed-stream: 200,000-item buffer (configurable, default handles days-long prints)
 - Transducer pipeline: Efficient, lazy transformations
 - Single file consumer: Prevents duplicate writes
 - Print tracking: In-memory atom (fast lookups)
+- Packet inspection: Limited to 100 items per buffer (prevents unbounded growth)
+- Large processed buffer: Prevents packet loss during slow archiving or high packet rates
 
 ** Frontend
 
-- Derived views: Computed on-demand (no caching)
-- State persistence: Debounced to avoid excessive writes
-- Timeline playback: 100ms interval (10 FPS)
-- Event sorting: Maintains sorted order on append (O(n log n))
+- Derived views: Computed on-demand (timeline data cached in atom)
+- State persistence: Debounced to avoid excessive writes (UI preferences only)
+- Timeline playback: 100ms interval (10 FPS, steps by packet msg)
+- Event merging: Maintains sorted order using O(n+m) merge (merge-sorted-events)
+- File loading: Batched processing (100 packets) to avoid blocking UI
+- Timeline data: Cached atom updates only when :telemetry-events changes
 
 ** Scalability
 
 - Multiple WebSocket clients: Each gets own consumer (scales linearly)
 - File persistence: Append-only writes (efficient)
-- State size: 4MB localStorage limit (prevents browser slowdown)
-- Event count: No hard limit (limited by localStorage size)
+- State persistence: Only UI preferences stored (small, fast)
+- Event count: No hard limit in memory (limited by browser memory)
+- File loading: Batched processing prevents UI blocking for large files
 
 * Future Improvements
 

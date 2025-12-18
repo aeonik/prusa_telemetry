@@ -101,7 +101,8 @@
      :metrics (map (fn [m]
                      (cond-> {:name (:name m)
                               :type (name (:type m))
-                              :tick (:tick m)
+                              :offset-ms (:offset-ms m)
+                              :tick-ms (:offset-ms m)  ; Compatibility alias for frontend
                               :device-time-us (:device-time-us m)
                               :device-time-str (:device-time-str m)}
                        (:value m) (assoc :value (:value m))
@@ -134,8 +135,9 @@
         (save-packet-to-file! (telemetry-to-json packet) print-filename-to-use)))))
 
 (defn websocket-handler
-  "WebSocket handler that streams telemetry data"
-  [processed-stream]
+  "WebSocket handler that streams telemetry data.
+   Each WebSocket connection gets its own subscription to ensure all clients see every packet."
+  [processed-bus]
   (fn [req]
     (let [ws-deferred (http/websocket-connection req)]
       ;; Set up the connection when it's ready (async, don't block)
@@ -143,16 +145,19 @@
                (fn [ws]
                  (println "WebSocket client connected")
                  
-                 ;; Forward processed-stream -> WebSocket
-                 (s/consume
-                  (fn [packet]
-                    (try
-                      (let [json-data (json/write-str (telemetry-to-json packet))]
-                        (s/put! ws json-data))
-                      (catch Exception e
-                        (println "Error sending WebSocket message:" (.getMessage e))
-                        (.printStackTrace e))))
-                  processed-stream)
+                 ;; Create subscription stream for this client (each client gets their own copy)
+                 (let [client-stream (s/stream 100)]
+                   ;; Connect bus to client stream (broadcasts to this client)
+                   (s/connect processed-bus client-stream)
+                   (s/consume
+                    (fn [packet]
+                      (try
+                        (let [json-data (json/write-str (telemetry-to-json packet))]
+                          (s/put! ws json-data))
+                        (catch Exception e
+                          (println "Error sending WebSocket message:" (.getMessage e))
+                          (.printStackTrace e))))
+                    client-stream))
                  
                  ;; Handle client messages (if any)
                  (s/consume
@@ -285,6 +290,127 @@
        :headers {"Content-Type" "application/json"}
        :body (json/write-str {:error (.getMessage e)})})))
 
+(defn- setup-packet-saving-consumer
+  "Set up a single consumer for saving packets (runs once per packet, not per WebSocket client).
+   Creates subscription stream and connects to bus to ensure we see every packet."
+  [telemetry-stream]
+  (let [saving-stream (s/stream 100)]
+    ;; Connect bus to saving stream (broadcasts to this consumer)
+    (s/connect telemetry-stream saving-stream)
+    (let [saving-consumer (s/consume 
+                           (fn [packet]
+                             (try
+                               (handle-packet-saving! packet)
+                               (catch Exception e
+                                 (println "ERROR processing packet for saving:" (.getMessage e))
+                                 (.printStackTrace e)))
+                             ;; Always return true to keep consuming
+                             true)
+                           saving-stream)]
+      ;; Handle errors in the consumer (log but don't crash)
+      (d/on-realized saving-consumer
+                     (fn [_] (println "Packet saving consumer closed"))
+                     (fn [error]
+                       (println "ERROR: Packet saving consumer failed:" (.getMessage error))
+                       (.printStackTrace error)))
+      (println "Packet saving consumer initialized"))))
+
+(defn- timeline-handler
+  "Serve the timeline HTML page"
+  [_req]
+  (if-let [resource (io/resource "timeline.html")]
+    {:status 200
+     :headers {"Content-Type" "text/html"}
+     :body (slurp resource)}
+    {:status 404
+     :headers {"Content-Type" "text/plain"}
+     :body "timeline.html not found"}))
+
+(defn- app-js-handler
+  "Serve the compiled app.js file"
+  [_req]
+  (let [app-js-file (io/file "resources/app.js")]
+    (if (and (.exists app-js-file) (.isFile app-js-file))
+      {:status 200
+       :headers {"Content-Type" "application/javascript"
+                "Last-Modified" (str (java.util.Date. (.lastModified app-js-file)))
+                "Cache-Control" "no-cache"}
+       :body (slurp app-js-file)}
+      (if-let [resource (io/resource "app.js")]
+        {:status 200
+         :headers {"Content-Type" "application/javascript"
+                  "Cache-Control" "no-cache"}
+         :body (slurp resource)}
+        {:status 404
+         :headers {"Content-Type" "text/plain"}
+         :body "app.js not found"}))))
+
+(defn- create-routes
+  "Create the route map for the HTTP server"
+  [telemetry-stream]
+  {"/" index-handler
+   "/timeline" timeline-handler
+   "/ws" (websocket-handler telemetry-stream)
+   "/api/telemetry-files" list-telemetry-files-handler
+   "/app.js" app-js-handler})
+
+(defn- create-request-handler
+  "Create the main request handler that routes requests to appropriate handlers"
+  [routes]
+  (fn [req]
+    (try
+      (let [uri (:uri req)]
+        (println "Request received:" uri "Method:" (:request-method req))
+        (println "Available routes:" (keys routes))
+        (println "Route match check:" (contains? routes uri))
+        (cond
+          ;; Check exact routes first
+          (contains? routes uri)
+          (do
+            (println "Matched route:" uri)
+            ((get routes uri) req))
+          
+          ;; Check for telemetry file loading endpoint
+          (str/starts-with? uri "/api/telemetry-file/")
+          (do
+            (println "Matched telemetry-file pattern")
+            (load-telemetry-file-handler req))
+          
+          ;; Then check for ClojureScript assets under /app.js/
+          (str/starts-with? uri "/app.js/")
+          (do
+            (println "Matched app.js pattern")
+            (cljs-asset-handler req))
+          
+          :else
+          (do
+            (println "No route matched for:" uri)
+            {:status 404
+             :headers {"Content-Type" "text/plain"}
+             :body (str "Not found. URI: " uri)})))
+      (catch Exception e
+        (println "Handler error:" (.getMessage e))
+        (.printStackTrace e)
+        {:status 500
+         :headers {"Content-Type" "text/plain"}
+         :body (str "Server error: " (.getMessage e))}))))
+
+(defn- start-http-server
+  "Start the HTTP server with the given handler and port"
+  [handler port]
+  (try
+    (println "Attempting to start server on port" port "...")
+    (let [srv (http/start-server handler {:port port})]
+      (println "Server object created successfully")
+      (Thread/sleep 1000) ; Give it time to bind
+      (println "Server should be ready, checking status...")
+      (println "Server closed?" (try (.isClosed srv) (catch Exception _ "unknown")))
+      srv)
+    (catch Exception e
+      (println "ERROR starting server:" (.getMessage e))
+      (.printStackTrace e)
+      (throw e))))
+
 (defn start-web-server
   "Start HTTP server with WebSocket support for telemetry streaming.
    
@@ -301,105 +427,13 @@
   (when (nil? telemetry-stream)
     (throw (ex-info "telemetry-stream is required" {})))
   
-  ;; Set up a single consumer for saving packets (runs once per packet, not per WebSocket client)
-  ;; Store the consumer deferred so we can track errors
-  (let [saving-consumer (s/consume 
-                         (fn [packet]
-                           (try
-                             (handle-packet-saving! packet)
-                             (catch Exception e
-                               (println "ERROR processing packet for saving:" (.getMessage e))
-                               (.printStackTrace e)))
-                           ;; Always return true to keep consuming
-                           true)
-                         telemetry-stream)]
-    ;; Handle errors in the consumer (log but don't crash)
-    (d/on-realized saving-consumer
-                   (fn [_] (println "Packet saving consumer closed"))
-                   (fn [error]
-                     (println "ERROR: Packet saving consumer failed:" (.getMessage error))
-                     (.printStackTrace error)))
-    (println "Packet saving consumer initialized"))
+  ;; Set up packet saving consumer
+  (setup-packet-saving-consumer telemetry-stream)
   
-  (let [timeline-handler (fn [_req]
-                          (if-let [resource (io/resource "timeline.html")]
-                            {:status 200
-                             :headers {"Content-Type" "text/html"}
-                             :body (slurp resource)}
-                            {:status 404
-                             :headers {"Content-Type" "text/plain"}
-                             :body "timeline.html not found"}))
-        routes {"/" index-handler
-                "/timeline" timeline-handler
-                "/ws" (websocket-handler telemetry-stream)
-                "/api/telemetry-files" list-telemetry-files-handler
-                "/app.js" (fn [_req]
-                            (let [app-js-file (io/file "resources/app.js")]
-                              (if (and (.exists app-js-file) (.isFile app-js-file))
-                                {:status 200
-                                 :headers {"Content-Type" "application/javascript"
-                                          "Last-Modified" (str (java.util.Date. (.lastModified app-js-file)))
-                                          "Cache-Control" "no-cache"}
-                                 :body (slurp app-js-file)}
-                                (if-let [resource (io/resource "app.js")]
-                                  {:status 200
-                                   :headers {"Content-Type" "application/javascript"
-                                            "Cache-Control" "no-cache"}
-                                   :body (slurp resource)}
-                                  {:status 404
-                                   :headers {"Content-Type" "text/plain"}
-                                   :body "app.js not found"}))))}
-        
-        handler (fn [req]
-                  (try
-                    (let [uri (:uri req)]
-                      (println "Request received:" uri "Method:" (:request-method req))
-                      (println "Available routes:" (keys routes))
-                      (println "Route match check:" (contains? routes uri))
-                      (cond
-                        ;; Check exact routes first
-                        (contains? routes uri)
-                        (do
-                          (println "Matched route:" uri)
-                          ((get routes uri) req))
-                        
-                        ;; Check for telemetry file loading endpoint
-                        (str/starts-with? uri "/api/telemetry-file/")
-                        (do
-                          (println "Matched telemetry-file pattern")
-                          (load-telemetry-file-handler req))
-                        
-                        ;; Then check for ClojureScript assets under /app.js/
-                        (str/starts-with? uri "/app.js/")
-                        (do
-                          (println "Matched app.js pattern")
-                          (cljs-asset-handler req))
-                        
-                        :else
-                        (do
-                          (println "No route matched for:" uri)
-                          {:status 404
-                           :headers {"Content-Type" "text/plain"}
-                           :body (str "Not found. URI: " uri)})))
-                    (catch Exception e
-                      (println "Handler error:" (.getMessage e))
-                      (.printStackTrace e)
-                      {:status 500
-                       :headers {"Content-Type" "text/plain"}
-                       :body (str "Server error: " (.getMessage e))})))
-        
-        server (try
-                 (println "Attempting to start server on port" port "...")
-                 (let [srv (http/start-server handler {:port port})]
-                   (println "Server object created successfully")
-                   (Thread/sleep 1000) ; Give it time to bind
-                   (println "Server should be ready, checking status...")
-                   (println "Server closed?" (try (.isClosed srv) (catch Exception _ "unknown")))
-                   srv)
-                 (catch Exception e
-                   (println "ERROR starting server:" (.getMessage e))
-                   (.printStackTrace e)
-                   (throw e)))]
+  ;; Create routes and handler
+  (let [routes (create-routes telemetry-stream)
+        handler (create-request-handler routes)
+        server (start-http-server handler port)]
     
     (println (format "Web server started on http://localhost:%d" port))
     (println (format "WebSocket endpoint: ws://localhost:%d/ws" port))
