@@ -1,0 +1,10 @@
+{
+  "name": "prusa-telemetry",
+  "version": "1.0.0",
+  "description": "Prusa Telemetry Dashboard",
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "shadow-cljs": "^3.3.4"
+  }
+}

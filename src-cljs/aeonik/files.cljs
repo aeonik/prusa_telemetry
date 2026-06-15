@@ -69,3 +69,47 @@
         (.catch (fn [error]
                  (println "Error loading telemetry file:" error)
                  (js/console.error error))))))
+
+(defn load-telemetry-file-replace
+  "Load a telemetry file as the active replay dataset."
+  [date filename]
+  (let [url (str (get-api-base-url) "/api/telemetry-file/" date "/" filename)
+        archive (str date ":" filename)]
+    (dispatch! {:type :replay/load-start :archive archive})
+    (-> (js/fetch url)
+        (.then (fn [response]
+                 (if (.-ok response)
+                   (-> (.json response)
+                       (.then (fn [data]
+                                (let [packets (js->clj data :keywordize-keys true)]
+                                  (println (str "Loading replay " (count packets) " packets from " filename))
+                                  (dispatch! {:type :data/load-file-replace
+                                             :archive archive
+                                             :packets packets}))))
+                       (.catch (fn [error]
+                                 (println "Error parsing telemetry replay file:" error)
+                                 (js/console.error error)
+                                 (dispatch! {:type :replay/load-error
+                                            :message (or (.-message error)
+                                                         "Error parsing telemetry replay file")}))))
+                   (-> (.json response)
+                       (.then (fn [data]
+                                (let [details (js->clj data :keywordize-keys true)]
+                                  (println "Replay file error details:" details)
+                                  (dispatch! {:type :replay/load-error
+                                             :message (or (:error details)
+                                                          "Error loading telemetry replay file")}))
+                                (js/Promise.resolve nil))
+                              (fn [error]
+                                (println "Error parsing replay error response:" error)
+                                (js/console.error error)
+                                (dispatch! {:type :replay/load-error
+                                           :message (or (.-message error)
+                                                        "Error loading telemetry replay file")})
+                                (js/Promise.resolve nil)))))))
+        (.catch (fn [error]
+                  (println "Error loading telemetry replay file:" error)
+                  (js/console.error error)
+                  (dispatch! {:type :replay/load-error
+                             :message (or (.-message error)
+                                          "Error loading telemetry replay file")}))))))

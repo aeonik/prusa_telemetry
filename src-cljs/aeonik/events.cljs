@@ -8,32 +8,96 @@
 ;; WebSocket message handlers
 ;; ============================================================================
 
+(defn- metric-type-name [metric-type]
+  (cond
+    (keyword? metric-type) (name metric-type)
+    (nil? metric-type) nil
+    :else (str metric-type)))
+
+(defn- metric-key [metric]
+  [(or (:sender metric) "") (or (:name metric) "")])
+
+(defn- metric-number [metric]
+  (let [value (:value metric)]
+    (when (and (number? value)
+               (not (js/isNaN value))
+               (js/isFinite value))
+      value)))
+
+(defn- parse-numeric-like [value]
+  (cond
+    (number? value) value
+    (string? value) (let [s (str/trim value)]
+                      (when (re-matches #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?" s)
+                        (let [n (js/parseFloat s)]
+                          (when-not (js/isNaN n)
+                            n))))
+    :else nil))
+
+(defn- field-entries [fields]
+  (cond
+    (map? fields) fields
+    (and (object? fields) (not (array? fields))) (js->clj fields :keywordize-keys false)
+    :else nil))
+
+(defn- metric-event
+  [sender wall-time-str wall-time-ms print-filename packet-msg received-at metric]
+  {:sender          sender
+   :name            (:name metric)
+   :value           (:value metric)
+   :fields          (:fields metric)
+   :error           (:error metric)
+   :type            (metric-type-name (:type metric))
+   :offset-us       (:offset-us metric)
+   :offset-ms       (:offset-ms metric)
+   :device-time-us  (:device-time-us metric)
+   :device-time-str (:device-time-str metric)
+   :wall-time-str   wall-time-str
+   :wall-time-ms    wall-time-ms
+   :packet-msg      packet-msg
+   :received-at     received-at
+   :print-filename  print-filename})
+
+(defn- structured-field-events [base-event]
+  (let [entries (field-entries (:fields base-event))]
+    (->> entries
+         (keep (fn [[field-name field-value]]
+                 (when-let [numeric-value (parse-numeric-like field-value)]
+                   (let [field-name-str (if (keyword? field-name)
+                                          (name field-name)
+                                          (str field-name))]
+                     (-> base-event
+                         (assoc :name (str (:name base-event) "." field-name-str)
+                                :value numeric-value
+                                :fields nil
+                                :type "numeric"
+                                :parent-name (:name base-event)
+                                :field-name field-name-str
+                                :synthetic-field? true)
+                         (dissoc :error))))))
+         vec)))
+
+(defn- expand-metric-event [base-event]
+  (let [field-events (when (= (:type base-event) "structured")
+                       (structured-field-events base-event))]
+    (if (seq field-events)
+      (into [(assoc base-event :has-numeric-fields? true)] field-events)
+      [base-event])))
+
 (defn- create-events
   "Create event records from metrics, one per metric.
    Returns a vector, never lazy sequences.
-   Device-time-us comes from the metrics themselves (calculated from prelude tm + tick).
+   Device-time-us comes from the metrics themselves (calculated from prelude tm + offset-us).
    Packet metadata (msg, received-at) is included for timeline navigation."
   [sender metrics wall-time-str print-filename packet-msg received-at]
   (let [wall-time-ms (or (u/parse-wall-time-str wall-time-str)
                          (when wall-time-str
                            (println "Warning: Failed to parse wall-time-str:" wall-time-str)
                            nil))]
-    (vec (map (fn [m]
-                {:sender          sender
-                 :name            (:name m)
-                 :value           (:value m)
-                 :fields          (:fields m)
-                 :error           (:error m)
-                 :type            (:type m)
-                 :tick            (:tick m)
-                 :device-time-us  (:device-time-us m)
-                 :device-time-str (:device-time-str m)
-                 :wall-time-str   wall-time-str
-                 :wall-time-ms    wall-time-ms
-                 :packet-msg      packet-msg
-                 :received-at     received-at
-                 :print-filename  print-filename})
-              metrics))))
+    (vec (mapcat (fn [m]
+                   (expand-metric-event
+                    (metric-event sender wall-time-str wall-time-ms print-filename packet-msg received-at m)))
+                 metrics))))
 
 (defn- time-range
   "Calculate time range from events using device-time-us (microseconds)"
@@ -117,6 +181,7 @@
                        (when-let [fields (:fields print-filename-metric)]
                          (if (map? fields)
                            (or (get fields "value")
+                               (get fields :value)
                                (first (vals fields)))
                            nil))))
         ;; Strip quotes and normalize
@@ -194,9 +259,22 @@
     (vec (sort-by get-event-time (persistent! events-vec)))))
 
 (def ^:private batch-size 100) ; Process packets in batches to avoid blocking UI
+(def ^:private live-event-limit 12000)
+(def ^:private replay-batch-size 250)
+(def ^:private replay-sample-limit 180)
 
 ;; Atom to track batch processing state
 (defonce batch-processing-state (atom nil))
+
+(defn- trim-live-events
+  "Keep the browser dashboard responsive by retaining only recent live events.
+   Full print archives are still saved on disk by the backend."
+  [events]
+  (let [events (if (vector? events) events (vec events))
+        event-count (count events)]
+    (if (> event-count live-event-limit)
+      (subvec events (- event-count live-event-limit))
+      events)))
 
 (defn- load-telemetry-packets-batch
   "Load a batch of telemetry packets into state.
@@ -270,18 +348,175 @@
           (-> (load-telemetry-packets-batch state packets)
               (ensure-timeline-selection nil)))))))
 
+(defn- append-replay-sample [samples value]
+  (let [samples (conj (or samples []) value)]
+    (if (> (count samples) (* 2 replay-sample-limit))
+      (vec (take-nth 2 samples))
+      samples)))
+
+(defn- update-replay-summary [summary event]
+  (let [value (metric-number event)
+        summary (-> (or summary {})
+                    (assoc :key (metric-key event)
+                           :sender (:sender event)
+                           :name (:name event)
+                           :type (:type event)
+                           :latest event
+                           :history (conj (or (:history summary) []) event)))]
+    (let [summary (update summary :event-count (fnil inc 0))]
+    (if-not (number? value)
+      summary
+      (let [sample-count (inc (or (:sample-count summary) 0))
+            first-value (if (contains? summary :first-value)
+                          (:first-value summary)
+                          value)
+            sum (+ (or (:sum summary) 0) value)]
+        (assoc summary
+               :numeric? true
+               :sample-count sample-count
+               :sum sum
+               :first-value first-value
+               :latest-number value
+               :min (if (number? (:min summary)) (min (:min summary) value) value)
+               :max (if (number? (:max summary)) (max (:max summary) value) value)
+               :samples (append-replay-sample (:samples summary) value)))))))
+
+(defn- replay-summary->card [summary]
+  (let [summary (update summary :history #(vec (sort-by :packet-msg %)))]
+    (if (:numeric? summary)
+      (assoc summary
+             :stats {:latest (:latest-number summary)
+                     :min (:min summary)
+                     :max (:max summary)
+                     :avg (/ (:sum summary) (:sample-count summary))
+                     :delta (- (:latest-number summary) (:first-value summary))
+                     :samples (:sample-count summary)})
+      summary)))
+
+(defn- replay-packet-events [build packet]
+  (let [sender (:sender packet)
+        metrics (:metrics packet)
+        wall-time-str (:wall-time-str packet)
+        prelude (:prelude packet)
+        packet-msg (or (:msg prelude) (:packet-count build))
+        received-at (:received-at packet)
+        print-filename (or (extract-print-filename-from-metrics metrics)
+                           (:print-filename build))]
+    {:packet-msg packet-msg
+     :received-at received-at
+     :wall-time-str wall-time-str
+     :print-filename print-filename
+     :events (create-events sender metrics wall-time-str print-filename packet-msg received-at)}))
+
+(defn- add-replay-packet [build packet]
+  (let [{:keys [packet-msg events print-filename] :as replay-packet} (replay-packet-events build packet)
+        packet-index (count (:packets build))
+        summaries (reduce (fn [acc event]
+                            (let [key (metric-key event)]
+                              (update acc key update-replay-summary event)))
+                          (:summaries build)
+                          events)
+        updated-build (cond-> (-> build
+                                  (update :packet-count inc)
+                                  (update :packets conj replay-packet)
+                                  (assoc-in [:packet-index packet-msg] packet-index)
+                                  (assoc :summaries summaries))
+                        print-filename
+                        (assoc :print-filename print-filename))]
+    (if (number? packet-msg)
+      (-> updated-build
+          (update :min-msg #(if (number? %) (min % packet-msg) packet-msg))
+          (update :max-msg #(if (number? %) (max % packet-msg) packet-msg)))
+      updated-build)))
+
+(defn- finalize-replay-data [build]
+  (let [cards (->> (vals (:summaries build))
+                   (map replay-summary->card)
+                   vec)
+        packet-range (when (and (number? (:min-msg build))
+                                (number? (:max-msg build)))
+                       {:min (:min-msg build)
+                        :max (:max-msg build)})]
+    {:archive (:archive build)
+     :print-filename (:print-filename build)
+     :packet-count (:packet-count build)
+     :packet-range packet-range
+     :packets (:packets build)
+     :packet-index (:packet-index build)
+     :metric-cards cards}))
+
+(defn- process-replay-batches! [build batches batch-index token]
+  (when (= token (:token @batch-processing-state))
+    (if (>= batch-index (count batches))
+      (let [data (finalize-replay-data build)
+            start-msg (get-in data [:packet-range :min])]
+        (swap! app-state
+               (fn [state]
+                 (-> state
+                     (assoc :selected-packet-msg start-msg)
+                     (assoc :selected-filename (:print-filename data))
+                     (assoc :timeline-playing false)
+                     (assoc-in [:replay :loading?] false)
+                     (assoc-in [:replay :load-progress] nil)
+                     (assoc-in [:replay :data] data)
+                     (assoc-in [:replay :error] nil)))))
+      (let [updated-build (reduce add-replay-packet build (nth batches batch-index))]
+        (swap! app-state
+               (fn [state]
+                 (-> state
+                     (assoc-in [:replay :load-progress]
+                               {:processed (:packet-count updated-build)
+                                :total (:total updated-build)}))))
+        (js/requestAnimationFrame
+         (fn []
+           (js/setTimeout
+            (fn []
+              (process-replay-batches! updated-build batches (inc batch-index) token))
+            0)))))))
+
+(defn- process-replay-packets! [archive packets]
+  (let [packets (if (vector? packets) packets (vec packets))
+        token (str archive ":" (.now js/Date))
+        batches (vec (partition-all replay-batch-size packets))
+        build {:archive archive
+               :total (count packets)
+               :packet-count 0
+               :packets []
+               :packet-index {}
+               :summaries {}
+               :print-filename nil
+               :min-msg nil
+               :max-msg nil}]
+    (reset! batch-processing-state {:token token})
+    (swap! app-state
+           (fn [state]
+             (-> state
+                 (assoc :telemetry-events [])
+                 (assoc :selected-packet-msg nil)
+                 (assoc :selected-filename nil)
+                 (assoc :timeline-playing false)
+                 (assoc-in [:replay :selected-run] archive)
+                 (assoc-in [:replay :loading?] true)
+                 (assoc-in [:replay :load-progress] {:processed 0 :total (count packets)})
+                 (assoc-in [:replay :data] nil)
+                 (assoc-in [:replay :error] nil))))
+    (js/setTimeout #(process-replay-batches! build batches 0 token) 0)))
+
 (defn- handle-ws-message
   [state {:keys [sender metrics wall-time-str print-filename prelude received-at]}]
   (if (not (map? state))
     (do
       (println "Error: handle-ws-message received non-map state:" (type state) state)
       {:telemetry-events [] :available-files [] :view-mode :latest})
+    (if (:paused state)
+      state
     (let [packet-msg (:msg prelude)
           received-at-ms (when received-at (if (number? received-at) received-at (.getTime received-at)))
           new-events-unsorted (create-events sender metrics wall-time-str print-filename packet-msg received-at-ms)
           ;; Sort new events before merging (they're from a single packet, so should be small)
           new-events (vec (sort-by get-event-time new-events-unsorted))
-          updated-events (merge-sorted-events (:telemetry-events state) new-events)
+          updated-events (trim-live-events
+                          (merge-sorted-events (:telemetry-events state) new-events))
           updated-state (assoc state :telemetry-events updated-events)]
       (when (and (seq new-events) (nil? (:device-time-us (first new-events))))
         (println "Warning: Events created without device-time-us. wall-time-str:" wall-time-str))
@@ -290,7 +525,7 @@
               (nil? (:selected-packet-msg updated-state))
               (and print-filename (not= print-filename (:selected-filename updated-state))))
         (ensure-timeline-selection updated-state print-filename)
-        updated-state))))
+        updated-state)))))
 
 ;; ============================================================================
 ;; Timeline event handlers
@@ -341,6 +576,61 @@
 
 (defn handle-event [state {:keys [type] :as ev}]
   (case type
+    :connection/open
+    (assoc state :connection :connected)
+
+	    :connection/close
+	    (assoc state :connection :disconnected)
+
+    :prusalink/status-success
+    (let [data (:data ev)
+          status-job (:job data)
+          cached-job (get-in state [:prusalink :job])
+          updated-state (-> state
+                            (assoc-in [:prusalink :connection] :connected)
+                            (assoc-in [:prusalink :status] data)
+                            (assoc-in [:prusalink :last-updated] (:received-at ev))
+                            (assoc-in [:prusalink :error] nil))]
+      (cond
+        (nil? status-job)
+        (assoc-in updated-state [:prusalink :job] nil)
+
+        (and cached-job (not= (:id cached-job) (:id status-job)))
+        (assoc-in updated-state [:prusalink :job] nil)
+
+        cached-job
+        (assoc-in updated-state [:prusalink :job] (merge cached-job status-job))
+
+        :else
+        (assoc-in updated-state [:prusalink :job] status-job)))
+
+    :prusalink/job-success
+    (-> state
+        (assoc-in [:prusalink :connection] :connected)
+        (assoc-in [:prusalink :job] (:data ev))
+        (assoc-in [:prusalink :last-job-updated] (:received-at ev))
+        (assoc-in [:prusalink :error] nil))
+
+    :prusalink/job-clear
+    (-> state
+        (assoc-in [:prusalink :job] nil)
+        (assoc-in [:prusalink :last-job-updated] (:received-at ev)))
+
+    :prusalink/print-state-success
+    (-> state
+        (assoc-in [:prusalink :print-state] (:data ev))
+        (assoc-in [:prusalink :last-print-state-updated] (:received-at ev))
+        (assoc-in [:prusalink :error] nil))
+
+    :prusalink/error
+    (-> state
+        (assoc-in [:prusalink :connection] :error)
+        (assoc-in [:prusalink :error] (:message ev))
+        (assoc-in [:prusalink :last-updated] (:received-at ev)))
+
+	    :ws/message
+	    (handle-ws-message state ev)
+
     :view/set
     (assoc state :view-mode (:mode ev))
 
@@ -349,11 +639,15 @@
                  :latest  :packets
                  :packets :timeline
                  :timeline :latest
+                 :dashboard :latest
                  :latest)]
       (assoc state :view-mode next))
 
     :data/clear
     (assoc state :telemetry-events [])
+
+    :pause/toggle
+    (update state :paused not)
 
     :timeline/set-filename
     (assoc state :selected-filename (:filename ev))
@@ -382,13 +676,68 @@
     :timeline/jump-to-end
     (handle-jump-to-end state ev)
 
-
     :data/load-file
     (if-let [packets (:packets ev)]
       (load-telemetry-packets state packets)
       (do
         (println "Warning: :data/load-file event missing :packets")
         state))
+
+    :data/load-file-replace
+    (if-let [packets (:packets ev)]
+      (do
+        (process-replay-packets! (:archive ev) packets)
+        state)
+      (do
+        (println "Warning: :data/load-file-replace event missing :packets")
+        state))
+
+    :replay/load-start
+    (-> state
+        (assoc :telemetry-events [])
+        (assoc :selected-packet-msg nil)
+        (assoc :selected-filename nil)
+        (assoc :timeline-playing false)
+        (assoc-in [:replay :selected-run] (:archive ev))
+        (assoc-in [:replay :loading?] true)
+        (assoc-in [:replay :load-progress] nil)
+        (assoc-in [:replay :data] nil)
+        (assoc-in [:replay :error] nil))
+
+    :replay/load-error
+    (-> state
+        (assoc-in [:replay :loading?] false)
+        (assoc-in [:replay :load-progress] nil)
+        (assoc-in [:replay :error] (:message ev)))
+
+    :replay/select-run
+    (assoc-in state [:replay :selected-run] (:archive ev))
+
+    :replay/gcode-loading
+    (-> state
+        (assoc-in [:replay :gcode] nil)
+        (assoc-in [:replay :gcode-file-name] (:file-name ev))
+        (assoc-in [:replay :gcode-loading?] true)
+        (assoc-in [:replay :gcode-error] nil))
+
+    :replay/gcode-loaded
+    (-> state
+        (assoc-in [:replay :gcode] (:gcode ev))
+        (assoc-in [:replay :gcode-file-name] (:file-name ev))
+        (assoc-in [:replay :gcode-loading?] false)
+        (assoc-in [:replay :gcode-error] nil))
+
+    :replay/gcode-error
+    (-> state
+        (assoc-in [:replay :gcode-loading?] false)
+        (assoc-in [:replay :gcode-error] (:message ev)))
+
+    :replay/clear-gcode
+    (-> state
+        (assoc-in [:replay :gcode] nil)
+        (assoc-in [:replay :gcode-file-name] nil)
+        (assoc-in [:replay :gcode-loading?] false)
+        (assoc-in [:replay :gcode-error] nil))
 
     :files/set-available
     (let [files-vec (vec (:files ev))] ; Ensure it's a vector, not a lazy seq

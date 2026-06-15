@@ -1,6 +1,7 @@
 (ns aeonik.app
   (:require [aeonik.events :refer [dispatch! init-timeline!]]
             [aeonik.files :as files]
+            [aeonik.prusalink :as prusalink]
             [aeonik.state :refer [app-state load-state-from-storage!] :as state]
             [aeonik.views :as views]
             [aeonik.ws :as ws]
@@ -53,15 +54,22 @@
   "Parameters: none.
    Returns: nil after bootstrapping the dashboard."
   []
-  (println "Initializing Prusa Telemetry Dashboard...")
-  (load-state-from-storage!)
-  (ensure-timeline-selection!)
-  (init-timeline!)
-  (ws/connect-websocket!)
-  ;; Fetch available files on initialization
-  (files/fetch-available-files!)
-  (when (= (.-pathname js/location) "/timeline")
-    (dispatch! {:type :view/set :mode :timeline}))
-  (mount-root!))
+  (let [path (.-pathname js/location)
+        replay-page? (= path "/replay")]
+    (println "Initializing Prusa Telemetry Dashboard...")
+    (load-state-from-storage!)
+    (ensure-timeline-selection!)
+    (init-timeline!)
+    (when-not replay-page?
+      (ws/connect-websocket!)
+      (prusalink/start-polling!))
+    ;; Fetch available files on initialization
+    (files/fetch-available-files!)
+    (case path
+      "/timeline" (dispatch! {:type :view/set :mode :timeline})
+      "/dashboard" (dispatch! {:type :view/set :mode :dashboard})
+      "/replay" (dispatch! {:type :view/set :mode :replay})
+      nil)
+    (mount-root!)))
 
 (set! (.-onload js/window) init)

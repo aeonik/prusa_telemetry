@@ -8,10 +8,29 @@
   (r/atom
    {:telemetry-events   []      ; All telemetry events, sorted by time
     :available-files    []      ; Available telemetry files from disk
-    :view-mode          :latest ; :latest | :packets | :timeline
+    :connection         :disconnected
+    :prusalink          {:connection :unknown
+                         :status nil
+                         :job nil
+                         :print-state nil
+                         :last-updated nil
+                         :last-job-updated nil
+                         :last-print-state-updated nil
+                         :error nil}
+    :paused             false
+    :view-mode          :latest ; :latest | :packets | :timeline | :dashboard | :replay
     :selected-packet-msg nil     ; Selected packet msg number for timeline scrubbing
     :selected-filename  nil     ; Selected file identifier (format: "date:filename")
-    :timeline-playing   false})) ; Timeline auto-play state
+    :timeline-playing   false    ; Timeline auto-play state
+    :replay             {:selected-run nil
+                         :loading? false
+                         :load-progress nil
+                         :data nil
+                         :error nil
+                         :gcode nil
+                         :gcode-file-name nil
+                         :gcode-loading? false
+                         :gcode-error nil}}))
 
 ;; Cached timeline data - updated only when :telemetry-events changes
 (defonce cached-timeline-data (r/atom {}))
@@ -76,28 +95,42 @@
   [events limit]
   (let [grouped-by-packet (partition-by (fn [e] [(:sender e) (:wall-time-str e)]) events)
         packets (map (fn [packet-events]
-                       (let [first-event (first packet-events)]
+                       (let [first-event (first packet-events)
+                             ;; Deduplicate metrics by name + device-time-us to avoid duplicates
+                             unique-metrics (let [seen (atom #{})
+                                                  metrics-list (map (fn [e]
+                                                                     {:name (:name e)
+                                                                      :value (:value e)
+                                                                      :fields (:fields e)
+                                                                      :error (:error e)
+                                                                      :type (:type e)
+                                                                      :offset-us (:offset-us e)
+                                                                      :offset-ms (:offset-ms e)
+                                                                      :device-time-us (:device-time-us e)
+                                                                      :device-time-str (:device-time-str e)})
+                                                                    packet-events)]
+                                               (vec (filter (fn [m]
+                                                              (let [key [(:name m) (:device-time-us m)]]
+                                                                (if (contains? @seen key)
+                                                                  false
+                                                                  (do
+                                                                    (swap! seen conj key)
+                                                                    true))))
+                                                            metrics-list)))]
                          {:sender (:sender first-event)
                           :wall-time-str (:wall-time-str first-event)
-                          :metrics (map (fn [e]
-                                          {:name (:name e)
-                                           :value (:value e)
-                                           :fields (:fields e)
-                                           :error (:error e)
-                                           :type (:type e)
-                                           :tick (:tick e)
-                                           :device-time-us (:device-time-us e)
-                                           :device-time-str (:device-time-str e)})
-                                        packet-events)}))
+                          :metrics (vec unique-metrics)}))
                      grouped-by-packet)]
     (vec (take-last limit packets))))
 
 (defn- get-persistable-state
   "Extract only UI preferences that should be persisted"
   [state]
-  (select-keys state [:selected-time
-                      :selected-filename
-                      :view-mode]))
+  {:selected-filename (:selected-filename state)
+   :selected-packet-msg (:selected-packet-msg state)
+   :view-mode (:view-mode state)
+   :replay {:selected-run (get-in state [:replay :selected-run])
+            :gcode-file-name (get-in state [:replay :gcode-file-name])}})
 
 (defn save-state-to-storage!
   "Save small UI preferences to localStorage (synchronous, fast for small data)"
@@ -131,7 +164,9 @@
                      parsed)
             ;; Merge: parsed UI preferences override current defaults
             ;; but preserve non-persisted fields (like telemetry-events) from current
-            merged-state (merge current parsed)]
+            merged-state (-> (merge current parsed)
+                             (assoc :replay (merge (:replay current)
+                                                   (:replay parsed))))]
         (reset! app-state merged-state)
         (println (str "UI preferences loaded from localStorage - view-mode: " (:view-mode parsed)))
         (js/setTimeout #(reset! loading-state? false) 100)

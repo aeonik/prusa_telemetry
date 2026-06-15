@@ -13,6 +13,8 @@
       "structured" (let [fields (:fields metric)]
                      (cond
                        (nil? fields) ""
+                       (map? fields)
+                       (str "{" (apply str (interpose ", " (map (fn [[k v]] (str k ": " v)) fields))) "}")
                        ;; Handle JavaScript objects
                        (and (object? fields) (not (array? fields)))
                        (let [keys (js/Object.keys fields)]
