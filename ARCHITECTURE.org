@@ -79,43 +79,38 @@ UDP Packet (Raw Text)
     ↓
 [UDP Socket] (aleph.udp)
     ↓
-parse-packet (parse-prelude, parse-metric-line)
+[input-buffer] (Manifold stream, buffer: 1000 items)
     ↓
-[parsed-stream] (Manifold stream, buffer: 100 items)
+Transducer Pipeline (composed):
+  - parse-packet (parse-prelude, parse-metric-line)
+  - filter-err (remove errors)
+  - sort (sort metrics by device-time-us)
+  - timestamps (add formatted timestamps)
+  - display (create display lines)
     ↓
-Transducer Pipeline:
-  - sort-metrics-xf (sort by device-time-us)
-  - add-formatted-time-xf (add formatted timestamps)
-  - format-for-display-xf (create display lines)
+[pipeline-out] (Manifold stream, processed packets)
     ↓
-[processed-stream] (Manifold stream, buffer: 200,000 items default, configurable)
-    ↓
+[fan-out] (Manifold stream, permanent, buffer: 100 items)
+    │   Main distribution point for multiple consumers
+    │
     ├─→ [saving-stream] (buffer: 100 items)
     │   └─→ [Single Consumer] handle-packet-saving!
-    │       ├─→ Detect print_filename
-    │       ├─→ Track active prints (sticky, 10min timeout)
-    │       └─→ save-packet-to-file! (append-only EDN)
+    │       ├─→ Detect print_filename from metrics
+    │       ├─→ Track active prints per sender (sticky, 10min timeout)
+    │       └─→ save-packet-to-file! (append-only EDN, one packet per line)
+    │           └─→ telemetry-data/prints/YYYY-MM-DD/<sanitized-filename>.edn
     │
-    ├─→ [tap-parsed] (buffer: 100 items, for REPL inspection)
-    │   └─→ [packet-buffer-parsed] (max 100 packets)
+    ├─→ [tap-stream] (buffer: 100 items, for REPL inspection)
+    │   └─→ Created via (:tap telemetry-server) function
+    │       └─→ Used by dev/user.clj for add-sink! / remove-sink!
     │
-    ├─→ [tap-processed] (buffer: 100 items, for REPL inspection)
-    │   └─→ [packet-buffer-processed] (max 100 packets)
-    │
-    └─→ [WebSocket Handler] (per client)
+    └─→ [WebSocket Handler] (per client connection)
         ├─→ [client-stream] (buffer: 100 items per client)
         ├─→ telemetry-to-json (convert to JSON)
         └─→ Stream to browser via WebSocket
 
-Alternative: Metric Stream (time-ordered metrics)
-[parsed-stream] → [subscription-stream] (buffer: 100 items)
-    ↓
-[create-metric-stream] (packet buffer: 2 packets, allows growth)
-    ↓
-[metric-stream] (buffer: 100 items)
-    ↓
-    ├─→ [metric-buffer] (max 100 metrics, for REPL inspection)
-    └─→ Time-ordered metric consumers
+Note: The fan-out stream is the main distribution point. Each consumer
+gets its own subscription via s/connect, ensuring all consumers see every packet.
 #+END_SRC
 
 ** Frontend Data Flow
@@ -217,11 +212,15 @@ Core telemetry parsing and processing.
 **** Streams
 
 - =socket= :: Raw UDP socket (aleph.udp)
-- =parsed-stream= :: Parsed packets (before transducers, buffer: 100 items)
-- =processed-stream= :: Fully processed packets (after transducers, buffer: 200,000 items default, configurable)
-  - Large buffer prevents packet loss during days-long prints
-  - Configurable via =:processed-buffer-size= option
-- =create-metric-stream= :: Creates time-ordered metric stream (packet buffer: 2 packets, metric stream buffer: 100 items)
+- =input-buffer= :: Input buffer stream (buffer: 1000 items) - receives from UDP socket
+- =pipeline-out= :: Output of transducer pipeline (processed packets)
+- =fan-out= :: Main distribution stream (permanent, buffer: 100 items)
+  - All consumers connect to this stream via =s/connect=
+  - Designed for multiple consumers (WebSocket clients, file saving, REPL taps)
+  - Each consumer gets its own subscription, ensuring all see every packet
+- =tap= :: Function that returns a new tap stream for REPL inspection
+  - Used by =dev/user.clj= for =add-sink!= / =remove-sink!=
+  - Creates a new stream connected to =fan-out= each time it's called
 
 *** aeonik.web-server
 
@@ -230,7 +229,15 @@ HTTP/WebSocket server and file persistence.
 **** Key Functions
 
 - =start-web-server= :: Starts HTTP server and sets up consumers
+  - Receives =:telemetry-stream= parameter (the fan-out stream from telemetry server)
+  - Sets up packet saving consumer via =setup-packet-saving-consumer=
+  - Creates routes including WebSocket handler
 - =websocket-handler= :: Handles WebSocket connections (one per client)
+  - Receives =telemetry-stream= (fan-out stream)
+  - Each client gets its own subscription stream via =s/connect=
+- =setup-packet-saving-consumer= :: Sets up single consumer for file saving
+  - Connects to =telemetry-stream= (fan-out) via =s/connect=
+  - Runs =handle-packet-saving!= once per packet
 - =handle-packet-saving!= :: Single consumer for file saving (runs once per packet)
 - =telemetry-to-json= :: Converts packet to JSON-serializable format
 - =save-packet-to-file!= :: Appends packet to EDN file (append-only, one per line)
@@ -245,8 +252,12 @@ HTTP/WebSocket server and file persistence.
 
 **** Streams
 
+- =telemetry-stream= :: Input parameter (fan-out stream from telemetry server)
 - =saving-stream= :: Subscription stream for packet saving (buffer: 100 items)
+  - Connected to =telemetry-stream= via =s/connect=
 - =client-stream= :: Per-WebSocket-client subscription stream (buffer: 100 items per client)
+  - Each client connection creates its own =client-stream=
+  - Connected to =telemetry-stream= via =s/connect=
 
 **** File Persistence
 
@@ -494,10 +505,12 @@ Timeline data is cached in an atom that updates only when :telemetry-events chan
 ** Stream Processing
 
 Backend uses Manifold streams for asynchronous processing:
-- Multiple consumers can attach to a stream
-- Transducers provide efficient transformations
-- Single consumer for file saving prevents duplicates
-- Each WebSocket client gets its own consumer
+- =fan-out= stream is the main distribution point for all consumers
+- Multiple consumers connect via =s/connect=, each gets its own subscription
+- Transducers provide efficient transformations in the pipeline
+- Single consumer for file saving prevents duplicates (runs once per packet)
+- Each WebSocket client gets its own subscription stream
+- =tap= function creates new streams for REPL inspection (via =add-sink!=)
 
 ** Print Lifecycle Tracking
 
@@ -571,7 +584,7 @@ Timeline playback uses a JavaScript interval:
 
 ** Accessing the Application
 
-- Development: =http://localhost:9630= (shadow-cljs dev server with REPL)
+- Development: =http://localhost:9632= (shadow-cljs dev server with REPL)
   - Shadow-cljs serves HTML/JS files and proxies all requests (including /ws and /api/*) to backend on port 8080
   - Frontend uses relative URLs - no port detection needed
 - Production: =http://localhost:8080= (direct web server)
@@ -591,18 +604,20 @@ Timeline playback uses a JavaScript interval:
 
 ** Manifold Stream Buffers
 
-Most Manifold streams use 100-item buffers to handle backpressure:
+Stream buffers are sized to handle backpressure while maintaining low latency:
 
-- =parsed-stream= :: 100 items (raw parsed packets)
-- =processed-stream= :: 200,000 items (after transducer pipeline, configurable via :processed-buffer-size)
-  - Large default to handle days-long prints before archiving
-  - Can be configured when starting telemetry server
-- =metric-stream= :: 100 items (unwrapped, time-ordered metrics)
-- =subscription-stream= :: 100 items (per metric-stream consumer)
+- =input-buffer= :: 1000 items (receives from UDP socket)
+- =pipeline-out= :: Output of transducer pipeline (no explicit buffer, uses backpressure)
+- =fan-out= :: 100 items (permanent, main distribution point)
+  - All consumers connect to this stream
+  - Buffer size balances throughput and memory usage
 - =client-stream= :: 100 items (per WebSocket client)
+  - Each client gets its own subscription stream
 - =saving-stream= :: 100 items (for packet file persistence)
-- =tap-parsed= :: 100 items (for REPL inspection)
-- =tap-processed= :: 100 items (for REPL inspection)
+  - Single consumer for all file saving operations
+- =tap-stream= :: 100 items (for REPL inspection)
+  - Created dynamically via =(:tap telemetry-server)= function
+  - Used by =dev/user.clj= for =add-sink!= / =remove-sink!=
 
 ** In-Memory Inspection Buffers
 
@@ -625,28 +640,31 @@ The metric stream uses a packet buffer for time-ordering:
 ** Buffer Size Summary
 
 - **Stream buffers**: 
-  - Most streams: 100 items each
-  - processed-stream: 200,000 items (default, configurable via :processed-buffer-size)
-  - Total: ~200,800 items capacity (dominated by processed-stream)
-- **Inspection buffers**: 100 items each (3 buffers = 300 total capacity)
-- **Packet registry**: Unbounded (grows with unique packets)
-- **Metric stream packet buffer**: 2 packets (default, configurable)
+  - input-buffer: 1000 items (UDP socket input)
+  - fan-out: 100 items (main distribution point)
+  - client-stream: 100 items per WebSocket client
+  - saving-stream: 100 items (file persistence)
+  - tap-stream: 100 items per REPL tap
+  - Total capacity scales with number of consumers
+- **Inspection buffers**: Managed by =dev/user.clj= sinks (not part of main pipeline)
 
-Note: The processed-stream buffer is intentionally large to handle days-long prints. 
-At ~2 seconds per packet, 200,000 items can buffer ~4.6 days of continuous printing.
+Note: Buffer sizes are tuned for low latency while handling backpressure.
+The fan-out stream's 100-item buffer balances throughput and memory usage.
+Each consumer gets its own subscription, so slow consumers don't block others.
 
 * Performance Considerations
 
 ** Backend
 
 - Stream buffering: 
-  - Most streams: 100-item buffers
-  - processed-stream: 200,000-item buffer (configurable, default handles days-long prints)
-- Transducer pipeline: Efficient, lazy transformations
-- Single file consumer: Prevents duplicate writes
-- Print tracking: In-memory atom (fast lookups)
-- Packet inspection: Limited to 100 items per buffer (prevents unbounded growth)
-- Large processed buffer: Prevents packet loss during slow archiving or high packet rates
+  - input-buffer: 1000 items (handles UDP bursts)
+  - fan-out: 100 items (main distribution, balances throughput/latency)
+  - Consumer streams: 100 items each (per WebSocket client, file saving, REPL taps)
+- Transducer pipeline: Efficient, composed transformations applied once
+- Fan-out pattern: Single source, multiple consumers via =s/connect=
+- Single file consumer: Prevents duplicate writes (runs once per packet)
+- Print tracking: In-memory atom (fast lookups, sticky behavior with timeout)
+- REPL taps: Created dynamically, don't affect main pipeline performance
 
 ** Frontend
 

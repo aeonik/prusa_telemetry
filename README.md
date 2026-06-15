@@ -18,12 +18,15 @@ The system consists of three main components:
    - Listens for UDP packets on port 8514 (default)
    - Parses binary telemetry data
    - Processes data through transducer pipeline (sorting, formatting, time conversion)
-   - Provides processed stream for consumption
+   - Provides `fan-out` stream for multiple consumers (WebSocket clients, file saving, REPL taps)
+   - Uses Manifold streams for asynchronous processing
 
 2. **Web Server** (`src/aeonik/web_server.clj`)
    - HTTP server on port 8080 (default)
    - Serves static HTML/CSS/JavaScript
    - WebSocket endpoint (`/ws`) for real-time data streaming
+   - Connects to telemetry server's `fan-out` stream
+   - Sets up packet saving consumer (saves to EDN files, keyed by print_filename)
    - Converts telemetry packets to JSON for client consumption
 
 3. **Web Dashboard** (`src-cljs/aeonik/app.cljs`)
@@ -98,7 +101,7 @@ For REPL-driven development with hot reloading - **it just works!**
    - The REPL session will be created (you may see "waiting for shadow-cljs runtimes")
    
 2. **Open the app in your browser**:
-   - Open `http://localhost:9630` (or 9631) in your browser
+   - Open `http://localhost:9632` in your browser
    - This completes the REPL connection - the "waiting" message will disappear
    - Shadow-cljs serves HTML/JS files from `resources/` and proxies all requests to the backend
    - WebSocket and API calls use relative URLs - shadow-cljs handles proxying automatically
@@ -126,9 +129,16 @@ For REPL-driven development with hot reloading - **it just works!**
 
 **Note**: 
 - Services auto-start when you jack in (configured in `dev/user.clj`)
-- Always access the app via `http://localhost:9630` during development for REPL support
+- Always access the app via `http://localhost:9632` during development for REPL support
 - The REPL will show "waiting for shadow-cljs runtimes" until you open the browser page
 - Once the browser loads, the REPL connection completes and you can evaluate ClojureScript code
+
+**Stream Architecture**:
+- Telemetry server creates a `fan-out` stream (main distribution point)
+- Web server connects to `fan-out` stream for WebSocket clients and file saving
+- Each consumer gets its own subscription via `s/connect`
+- Use `(user/add-sink! :name callback)` in REPL to inspect packets
+- See `ARCHITECTURE.org` for detailed stream topology documentation
 
 ### Run Telemetry Server Only
 
@@ -199,6 +209,34 @@ The dashboard handles three metric types:
 1. **Numeric**: Simple numeric values (temperatures, positions, etc.)
 2. **Structured**: Complex data with key-value pairs (runtime stats, network info, etc.)
 3. **Error**: Error messages from the printer
+
+### Data Persistence
+
+Telemetry packets are automatically saved to disk:
+- **Location**: `telemetry-data/prints/YYYY-MM-DD/<sanitized-filename>.edn`
+- **Format**: Append-only EDN files (one packet per line)
+- **Keying**: Packets are saved by `print_filename` metric (extracted from telemetry)
+- **Tracking**: Active prints are tracked per sender with sticky behavior (10 minute timeout)
+- **Loading**: Use the Timeline view to load and view saved print data
+
+### PrusaLink API Auth
+
+PrusaLink credentials are read from `config/prusalink.edn`, which is ignored by git.
+Copy `config/prusalink.edn.example` and replace the placeholders:
+
+```clojure
+{:base-url "http://printer.local"
+ :username "your-username"
+ :password "your-password"}
+```
+
+You can override the location with `PRUSALINK_AUTH_FILE=/path/to/prusalink.edn`.
+The service exposes `/api/prusalink/auth` to confirm whether the auth file is present and valid without returning the password.
+It also proxies the printer API through backend Digest auth:
+
+- `/api/prusalink/status` -> printer `/api/v1/status`
+- `/api/prusalink/job` -> printer `/api/v1/job`
+- `/api/prusalink/connection` -> printer `/api/connection`
 
 ### Latest Values View
 
