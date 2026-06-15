@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SESSION="${PRUSA_TELEMETRY_TMUX_SESSION:-prusa-telemetry-dev}"
+
+NREPL_BIND="${NREPL_BIND:-127.0.0.1}"
+NREPL_PORT="${NREPL_PORT:-7888}"
+SHADOW_NREPL_PORT="${SHADOW_NREPL_PORT:-9631}"
+TELEMETRY_PORT="${TELEMETRY_PORT:-8514}"
+WEB_PORT="${WEB_PORT:-8080}"
+SHADOW_HTTP_PORT="${SHADOW_HTTP_PORT:-9632}"
+
+has_session() {
+  tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+print_endpoints() {
+  cat <<EOF
+backend nREPL: ${NREPL_BIND}:${NREPL_PORT}
+shadow nREPL:  127.0.0.1:${SHADOW_NREPL_PORT}
+app:           http://localhost:${SHADOW_HTTP_PORT}
+backend HTTP:  http://localhost:${WEB_PORT}
+telemetry UDP: ${TELEMETRY_PORT}
+EOF
+}
+
+start_service() {
+  if has_session; then
+    echo "Already running in tmux session: ${SESSION}"
+    print_endpoints
+    return 0
+  fi
+
+  mkdir -p "$ROOT/log"
+
+  tmux new-session -d -s "$SESSION" -c "$ROOT" -n backend \
+    "env PRUSA_TELEMETRY_AUTO_START=false NREPL_BIND='${NREPL_BIND}' NREPL_PORT='${NREPL_PORT}' TELEMETRY_PORT='${TELEMETRY_PORT}' WEB_PORT='${WEB_PORT}' clojure -M:dev:dev-service 2>&1 | tee -a log/dev-backend.log"
+
+  tmux new-window -t "${SESSION}:" -c "$ROOT" -n shadow \
+    "clojure -M:shadow-cljs --config-merge '{:nrepl {:port ${SHADOW_NREPL_PORT}} :dev-http {${SHADOW_HTTP_PORT} {:root \"resources\" :proxy-url \"http://localhost:${WEB_PORT}\"}}}' watch app 2>&1 | tee -a log/dev-shadow.log"
+
+  echo "Started tmux session: ${SESSION}"
+  print_endpoints
+}
+
+stop_service() {
+  if ! has_session; then
+    echo "Not running: ${SESSION}"
+    return 0
+  fi
+
+  tmux send-keys -t "${SESSION}:backend" C-c 2>/dev/null || true
+  tmux send-keys -t "${SESSION}:shadow" C-c 2>/dev/null || true
+
+  for _ in $(seq 1 20); do
+    if ! has_session; then
+      echo "Stopped tmux session: ${SESSION}"
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  echo "Stopped tmux session: ${SESSION}"
+}
+
+status_service() {
+  if has_session; then
+    echo "running: ${SESSION}"
+    tmux list-windows -t "$SESSION" -F '  #I:#W #{pane_current_command}'
+    print_endpoints
+  else
+    echo "stopped: ${SESSION}"
+  fi
+}
+
+attach_service() {
+  if ! has_session; then
+    echo "Not running: ${SESSION}"
+    exit 1
+  fi
+  exec tmux attach-session -t "$SESSION"
+}
+
+tail_logs() {
+  mkdir -p "$ROOT/log"
+  touch "$ROOT/log/dev-backend.log" "$ROOT/log/dev-shadow.log"
+  exec tail -n 80 -f "$ROOT/log/dev-backend.log" "$ROOT/log/dev-shadow.log"
+}
+
+connect_backend_repl() {
+  exec clojure -M:nrepl-client -m nrepl.cmdline --connect --host "$NREPL_BIND" --port "$NREPL_PORT"
+}
+
+connect_shadow_repl() {
+  exec clojure -M:nrepl-client -m nrepl.cmdline --connect --host 127.0.0.1 --port "$SHADOW_NREPL_PORT"
+}
+
+usage() {
+  cat <<EOF
+Usage: bin/dev-service <command>
+
+Commands:
+  start        Start backend service, backend nREPL, shadow watch, and shadow nREPL
+  stop         Stop the tmux-managed dev service
+  restart      Stop and start the dev service
+  status       Show service status and endpoints
+  attach       Attach to the tmux session
+  logs         Tail backend and shadow logs
+  repl         Connect to the backend Clojure nREPL
+  cljs-repl    Connect to the shadow-cljs nREPL
+
+Environment:
+  NREPL_PORT=${NREPL_PORT}
+  SHADOW_NREPL_PORT=${SHADOW_NREPL_PORT}
+  TELEMETRY_PORT=${TELEMETRY_PORT}
+  WEB_PORT=${WEB_PORT}
+  SHADOW_HTTP_PORT=${SHADOW_HTTP_PORT}
+EOF
+}
+
+command="${1:-status}"
+case "$command" in
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) stop_service; start_service ;;
+  status) status_service ;;
+  attach) attach_service ;;
+  logs) tail_logs ;;
+  repl) connect_backend_repl ;;
+  cljs-repl) connect_shadow_repl ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

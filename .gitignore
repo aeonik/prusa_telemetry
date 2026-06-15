@@ -21,6 +21,14 @@
 .sw*
 .shadow-cljs/
 telemetry-data/
+config/prusalink.edn
+node_modules/
+resources/js/
+resources/public/
+result.json
+__pycache__/
+*.pyc
+*.sync-conflict-*
 .vscode
 *.class
 *.jar

@@ -1,8 +1,10 @@
 {:deps true
 
- ;; Serve frontend from shadow on 9630, but proxy backend endpoints to 8080
+ :nrepl {:port 9631}
+
+ ;; Serve frontend from shadow on 9632, but proxy backend endpoints to 8080
  :dev-http
- {9630 {:root      "resources"          ; so /dashboard works
+ {9632 {:root      "resources"          ; so /dashboard works
         :proxy-url "http://localhost:8080"}} ; /api/*, /ws, etc -> backend
 
  :builds

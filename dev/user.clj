@@ -14,6 +14,7 @@
    [shadow.cljs.devtools.server :as server]
    [shadow.cljs.devtools.api :as shadow]
    [manifold.stream :as s]
+   [clojure.string :as str]
    [clojure.pprint :as pp]))
 
 ;; ============================================================
@@ -84,10 +85,10 @@
   ([{:keys [port] :or {port 8080}}]
    (when-not @web-server
      (or @telemetry-server (start-telemetry!))
-     (let [tap ((:tap @telemetry-server))]
-       (reset! web-server
-               (web/start-web-server {:port port :telemetry-stream tap}))
-       (println "✓ Web on port" port "| ws://localhost:" port "/ws")))
+     (reset! web-server
+            (web/start-web-server {:port port
+                                    :telemetry-stream (:fan-out @telemetry-server)}))
+     (println "✓ Web on port" port "| ws://localhost:" port "/ws"))
    @web-server))
 
 (defn stop-web! []
@@ -221,12 +222,29 @@
 ;; Auto-start (quiet—no console sink)
 ;; ============================================================
 
+(defn- falsey-config-value?
+  "Return true when a config value explicitly disables a boolean option."
+  [value]
+  (boolean
+   (when value
+     (#{"0" "false" "no" "off"}
+      (str/lower-case (str/trim (str value)))))))
+
+(defn- auto-start-enabled?
+  "Return true unless auto-start has been explicitly disabled."
+  []
+  (not
+   (falsey-config-value?
+    (or (System/getenv "PRUSA_TELEMETRY_AUTO_START")
+        (System/getProperty "prusa.telemetry.auto-start")))))
+
 (defonce ^:private _auto-start
-  (future
-    (Thread/sleep 1000)
-    (try (start!)
-         (catch Exception e
-           (println "Auto-start failed:" (.getMessage e))))))
+  (when (auto-start-enabled?)
+    (future
+      (Thread/sleep 1000)
+      (try (start!)
+           (catch Exception e
+             (println "Auto-start failed:" (.getMessage e)))))))
 
 ;; ============================================================
 ;; REPL examples
