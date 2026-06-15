@@ -20,6 +20,22 @@
                               (when-not (js/isNaN n) n)))))
     :else nil))
 
+(defn- parse-double-safe
+  "Parameters: v any value convertible to a double.
+   Returns: double value when possible, otherwise nil without throwing."
+  [v]
+  (cond
+    (number? v) (double v)
+    (string? v) (let [s (str/trim v)]
+                  (when (seq s)
+                    #?(:clj (try
+                              (Double/parseDouble s)
+                              (catch Exception _
+                                nil))
+                       :cljs (let [n (js/parseFloat s)]
+                               (when-not (js/isNaN n) n)))))
+    :else nil))
+
 (defn normalize-available-files
   "Parameters: files collection of file info maps with :date and :filename keys.
    Returns: vector of sanitized file maps with string dates, filenames, sizes, and optional :modified timestamps.
@@ -80,7 +96,8 @@
                                                 :fields          (:fields m)
                                                 :error           (:error m)
                                                 :type            (:type m)
-                                                :tick            (parse-long-safe (:tick m))
+                                                :offset-us       (parse-long-safe (:offset-us m))
+                                                :offset-ms       (parse-double-safe (:offset-ms m))
                                                 :device-time-us  (parse-long-safe (:device-time-us m))
                                                 :device-time-str (as-string (:device-time-str m))
                                                 :wall-time-ms    (parse-long-safe (:wall-time-ms m))})))})))

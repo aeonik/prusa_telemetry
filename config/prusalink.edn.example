@@ -1,0 +1,3 @@
+{:base-url "http://printer.local"
+ :username "put-username-here"
+ :password "put-password-here"}

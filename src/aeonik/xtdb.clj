@@ -22,11 +22,11 @@
   Returns a namespaced string identifier that combines message metadata and the metric name."
   [prelude metric sender]
   (let [msg    (or (:msg prelude) "msg")
-        tm     (or (:tm prelude) 0)
-        tick   (or (:tick metric) 0)
+        tm     (or (:base-time-us prelude) (:tm prelude) 0)
+        offset (or (:offset-us metric) 0)
         name   (or (:name metric) "metric")
         source (some-> sender str (str/replace #"\s" ""))]
-    (str msg ":" tm ":" tick ":" name (when source (str ":" source)))))
+    (str msg ":" tm ":" offset ":" name (when source (str ":" source)))))
 
 (defn build-metric-docs
   "Transform a parsed telemetry packet into XTDB-ready documents.
@@ -42,13 +42,14 @@
     table-name]
    (let [ingested-at (or received-at (java.util.Date.))
          base-msg    (:msg prelude)
-         base-tm     (:tm prelude)]
+         base-tm     (or (:base-time-us prelude) (:tm prelude))]
      (mapv (fn [metric]
              (cond-> {:xt/id                       (metric-doc-id prelude metric sender)
                       :telemetry/name              (:name metric)
                       :telemetry/value             (:value metric)
                       :telemetry/type              (:type metric)
-                      :telemetry/tick              (:tick metric)
+                      :telemetry/offset-us         (:offset-us metric)
+                      :telemetry/offset-ms         (:offset-ms metric)
                       :telemetry/device-time-us    (:device-time-us metric)
                       :telemetry/device-time-str   (:device-time-str metric)
                       :telemetry/sender            (some-> sender str)
@@ -303,9 +304,9 @@
    
    Example:
    (insert-test-packet! (:node @xtdb-node)
-                        {:prelude {:msg 7 :tm 9000}
-                         :metrics [{:name \"temp\" :value 25 :tick 1 :device-time-us 2000}
-                                  {:name \"status\" :fields {:state \"ready\"} :tick 2}]
+                        {:prelude {:msg 7 :base-time-us 9000}
+                         :metrics [{:name \"temp\" :value 25 :offset-us 1 :device-time-us 2000}
+                                   {:name \"status\" :fields {:state \"ready\"} :offset-us 2}]
                          :sender \"test-printer\"})"
   ([connectable packet]
    (insert-test-packet! connectable packet {}))

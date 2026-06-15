@@ -49,31 +49,46 @@
           {}
           (map #(str/split % #"=" 2) (str/split (or s "") #","))))
 
+(defn- add-timing-fields
+  "Attach metric timing fields from the firmware line offset.
+   The firmware emits the offset in microseconds relative to the packet `tm`
+   header."
+  [metric offset-us base-tm-us]
+  (cond-> (assoc metric
+                 :offset-us offset-us
+                 :offset-ms (when offset-us (/ offset-us 1000.0)))
+    (and offset-us base-tm-us) (assoc :device-time-us (+ base-tm-us offset-us))))
+
 (defn parse-metric-line [line base-tm-us]
-  (let [tokens (str/split (str/trim line) #"\s+")
-        name   (first tokens)
-        ntoken (count tokens)]
-    (when (seq name)
-      (let [second-tok (second tokens)
-            offset-ms  (parse-long? (last tokens))
-            ts         (when (and offset-ms base-tm-us)
-                         (+ base-tm-us (* offset-ms 1000)))]
-        (cond
-          (and (>= ntoken 3) (str/starts-with? (or second-tok "") "v="))
-          {:type :numeric, :name name, :value (parse-value (subs second-tok 2)),
-           :offset-ms offset-ms, :device-time-us ts}
+  (let [line (str/trim line)]
+    (when (seq line)
+      (if-let [[_ name raw-value raw-offset] (re-matches #"^(\S+)\s+v=(.+)\s+(-?\d+)\s*$" line)]
+        (let [offset-us (parse-long? raw-offset)]
+          (add-timing-fields
+           {:type :numeric, :name name, :value (parse-value raw-value)}
+           offset-us
+           base-tm-us))
+        (let [tokens (str/split line #"\s+")
+              name (first tokens)
+              ntoken (count tokens)
+              second-tok (second tokens)
+              offset-us (parse-long? (last tokens))]
+          (cond
+            (and (>= ntoken 3) (str/starts-with? (or second-tok "") "error="))
+            (add-timing-fields
+             {:type :error, :name name,
+              :error (or (second (re-find #"error=\"([^\"]*)\"" line)) "")}
+             offset-us
+             base-tm-us)
 
-          (and (>= ntoken 3) (str/starts-with? (or second-tok "") "error="))
-          {:type :error, :name name,
-           :error (or (second (re-find #"error=\"([^\"]*)\"" line)) ""),
-           :offset-ms offset-ms, :device-time-us ts}
+            (>= ntoken 3)
+            (add-timing-fields
+             {:type :structured, :name name,
+              :fields (parse-kv-pairs (str/join " " (drop 1 (drop-last 1 tokens))))}
+             offset-us
+             base-tm-us)
 
-          (>= ntoken 3)
-          {:type :structured, :name name,
-           :fields (parse-kv-pairs (str/join " " (drop 1 (drop-last 1 tokens)))),
-           :offset-ms offset-ms, :device-time-us ts}
-
-          :else {:type :unknown, :name name, :raw line})))))
+            :else {:type :unknown, :name name, :raw line}))))))
 
 (defn parse-packet [{:keys [message sender]}]
   (try
@@ -103,9 +118,11 @@
                   (mapv (fn [m]
                           (assoc m :device-time-str
                                  (when-let [us (:device-time-us m)]
-                                   (format "%02d:%06.3f"
-                                           (int (/ us 60000000))
-                                           (mod (/ us 1000000.0) 60)))))
+                                   (let [total-seconds (/ us 1000000.0)
+                                         hours (int (/ total-seconds 3600))
+                                         minutes (int (/ (mod total-seconds 3600) 60))
+                                         seconds (mod total-seconds 60)]
+                                     (format "%02d:%02d:%05.2f" hours minutes (double seconds))))))
                         ms))))))
 
 (defn format-value [m]
