@@ -139,6 +139,8 @@
             {:status 200
              :headers {"Content-Type" "application/edn; charset=utf-8"
                        "Content-Length" (str (.length file-path))
+                       "Access-Control-Allow-Origin" "*"
+                       "Access-Control-Expose-Headers" "Content-Length"
                        "Cache-Control" "no-store"}
              :body file-path}))
         {:status 400

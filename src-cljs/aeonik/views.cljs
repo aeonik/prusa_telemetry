@@ -627,7 +627,9 @@
                                                              available-files))]
                                 (when file-info
                                   (dispatch! {:type :replay/select-run :archive value})
-                                  (files/load-telemetry-file-replace (:date file-info) (:filename file-info)))))))}
+                                  (files/load-telemetry-file-replace (:date file-info)
+                                                                     (:filename file-info)
+                                                                     (:size file-info)))))))}
     [:option {:key "empty" :value ""} "-- Select run --"]
     (map (fn [file-info]
            (let [archive (str (:date file-info) ":" (:filename file-info))]
@@ -851,7 +853,8 @@
                                                 available-files))]
               (reset! replay-autoload-run selected-run)
               (js/setTimeout #(files/load-telemetry-file-replace (:date file-info)
-                                                                 (:filename file-info))
+                                                                 (:filename file-info)
+                                                                 (:size file-info))
                              0)))
         _ (when (and packet-range current-packet-msg
                      (not= current-packet-msg (:selected-packet-msg app-state)))

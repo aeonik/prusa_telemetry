@@ -175,22 +175,25 @@
 
 (defn- start-replay-stream-load
   [state {:keys [archive token total bytes-total]}]
-  (reset! batch-processing-state
-          {:token token
-           :build (replay-index/empty-build archive total)})
-  (-> state
-      (assoc :telemetry-events [])
-      (assoc :selected-packet-msg nil)
-      (assoc :selected-filename nil)
-      (assoc :timeline-playing false)
-      (assoc-in [:replay :selected-run] archive)
-      (assoc-in [:replay :loading?] true)
-      (assoc-in [:replay :load-progress] {:processed 0
-                                           :total total
-                                           :bytes-loaded 0
-                                           :bytes-total bytes-total})
-      (assoc-in [:replay :data] nil)
-      (assoc-in [:replay :error] nil)))
+  (if (= token (:token @batch-processing-state))
+    (do
+      (reset! batch-processing-state
+              {:token token
+               :build (replay-index/empty-build archive total)})
+      (-> state
+          (assoc :telemetry-events [])
+          (assoc :selected-packet-msg nil)
+          (assoc :selected-filename nil)
+          (assoc :timeline-playing false)
+          (assoc-in [:replay :selected-run] archive)
+          (assoc-in [:replay :loading?] true)
+          (assoc-in [:replay :load-progress] {:processed 0
+                                               :total total
+                                               :bytes-loaded 0
+                                               :bytes-total bytes-total})
+          (assoc-in [:replay :data] nil)
+          (assoc-in [:replay :error] nil)))
+    state))
 
 (defn- replay-stream-token-active?
   [token]
@@ -213,6 +216,13 @@
           updated-build (reduce replay-index/add-packet build packets)]
       (swap! batch-processing-state assoc :build updated-build)
       (assoc-in state [:replay :load-progress] (progress-from-build updated-build ev)))
+    state))
+
+(defn- update-replay-stream-progress
+  [state {:keys [token] :as ev}]
+  (if (replay-stream-token-active? token)
+    (let [build (:build @batch-processing-state)]
+      (assoc-in state [:replay :load-progress] (progress-from-build build ev)))
     state))
 
 (defn- complete-replay-stream-load
@@ -424,7 +434,7 @@
 
     :replay/load-start
     (do
-      (reset! batch-processing-state nil)
+      (reset! batch-processing-state {:token (:token ev)})
       (-> state
           (assoc :telemetry-events [])
           (assoc :selected-packet-msg nil)
@@ -432,23 +442,34 @@
           (assoc :timeline-playing false)
           (assoc-in [:replay :selected-run] (:archive ev))
           (assoc-in [:replay :loading?] true)
-          (assoc-in [:replay :load-progress] nil)
+          (assoc-in [:replay :load-progress]
+                    (cond-> {:processed 0
+                             :total nil
+                             :bytes-loaded 0}
+                      (:bytes-total ev)
+                      (assoc :bytes-total (:bytes-total ev))))
           (assoc-in [:replay :data] nil)
           (assoc-in [:replay :error] nil)))
 
     :replay/load-error
-    (do
-      (reset! batch-processing-state nil)
-      (-> state
-          (assoc-in [:replay :loading?] false)
-          (assoc-in [:replay :load-progress] nil)
-          (assoc-in [:replay :error] (:message ev))))
+    (if (or (nil? (:token ev))
+            (replay-stream-token-active? (:token ev)))
+      (do
+        (reset! batch-processing-state nil)
+        (-> state
+            (assoc-in [:replay :loading?] false)
+            (assoc-in [:replay :load-progress] nil)
+            (assoc-in [:replay :error] (:message ev))))
+      state)
 
     :replay/stream-start
     (start-replay-stream-load state ev)
 
     :replay/stream-batch
     (append-replay-stream-batch state ev)
+
+    :replay/stream-progress
+    (update-replay-stream-progress state ev)
 
     :replay/stream-complete
     (complete-replay-stream-load state ev)
