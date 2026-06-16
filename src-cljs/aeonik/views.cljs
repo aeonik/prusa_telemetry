@@ -657,7 +657,10 @@
     (cond
       gcode-error gcode-error
       gcode-loading? (str "Loading " gcode-file-name)
-      gcode (str gcode-file-name " / " (count (:segments gcode)) " moves")
+      gcode (str gcode-file-name " / "
+                 (count (:segments gcode)) " moves"
+                 (when-let [total-layers (:total-layers gcode)]
+                   (str " / " total-layers " layers")))
       gcode-file-name (str "Previous G-code: " gcode-file-name)
       :else "No G-code loaded")]])
 

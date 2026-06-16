@@ -7,6 +7,12 @@
       (when-not (js/isNaN n)
         n))))
 
+(defn- parse-int [s]
+  (when s
+    (let [n (js/parseInt s 10)]
+      (when-not (js/isNaN n)
+        n))))
+
 (defn- words [code]
   (->> (re-seq #"([A-Za-z])([-+]?(?:\d+(?:\.\d*)?|\.\d+))" code)
        (map (fn [[_ letter value]]
@@ -26,6 +32,16 @@
     (str/starts-with? comment "WIDTH:") current-feature
     (str/blank? comment) current-feature
     :else current-feature))
+
+(defn- total-layer-count [text]
+  (some-> (or (second (re-find #"(?im)^;\s*total layer number:\s*(\d+)\s*$" text))
+              (second (re-find #"(?im)^;\s*total layers count\s*=\s*(\d+)\s*$" text)))
+          parse-int))
+
+(defn- has-explicit-layer-markers? [text]
+  (boolean
+   (or (re-find #"(?im)^;\s*LAYER_CHANGE\s*$" text)
+       (re-find #"(?im)^;\s*LAYER:\d+\s*$" text))))
 
 (defn- update-bounds [bounds x y]
   (if (and (number? x) (number? y))
@@ -90,8 +106,20 @@
        :feature feature
        :command code})))
 
-(defn- update-layer [state next-z]
-  (if (and (number? next-z)
+(defn- update-layer-from-comment [state comment]
+  (let [comment (some-> comment str/trim str/upper-case)]
+    (cond
+      (= "LAYER_CHANGE" comment)
+      (update state :layer #(if (number? %) (inc %) 0))
+
+      (re-matches #"LAYER:\d+" (or comment ""))
+      (assoc state :layer (parse-int (subs comment (count "LAYER:"))))
+
+      :else state)))
+
+(defn- update-layer-from-z [state next-z]
+  (if (and (not (:explicit-layer-markers? state))
+           (number? next-z)
            (number? (:z state))
            (> next-z (:z state)))
     (update state :layer inc)
@@ -101,7 +129,10 @@
   "Parse text G-code into lightweight toolpath segments for replay.
    Offsets are character offsets, which match byte offsets for normal ASCII G-code."
   [text]
-  (let [lines (str/split (or text "") #"\r?\n")]
+  (let [text (or text "")
+        lines (str/split text #"\r?\n")
+        explicit-layers? (has-explicit-layer-markers? text)
+        total-layers (total-layer-count text)]
     (loop [remaining lines
            line-number 1
            offset 0
@@ -110,50 +141,56 @@
                   :z nil
                   :e 0
                   :f nil
-                  :layer 0
+                  :layer (when-not explicit-layers? 0)
                   :feature nil
+                  :explicit-layer-markers? explicit-layers?
                   :absolute-xyz? true
                   :absolute-e? true}
            segments []
            bounds nil]
       (if-not (seq remaining)
-        {:segments segments
-         :segments-by-layer (group-by :layer segments)
-         :bounds bounds
-         :line-count (dec line-number)
-         :byte-length (count (or text ""))
-         :layers (->> segments (map :layer) distinct sort vec)}
+        (let [layers (->> segments (keep :layer) distinct sort vec)]
+          {:segments segments
+           :segments-by-layer (group-by :layer segments)
+           :bounds bounds
+           :line-count (dec line-number)
+           :byte-length (count text)
+           :layers layers
+           :total-layers (or total-layers
+                             (when (seq layers) (count layers)))})
         (let [line (first remaining)
               [code comment] (split-comment line)
               command (some-> (first (str/split code #"\s+")) str/upper-case)
               word-map (words code)
               end-offset (+ offset (count line))
-              state-with-feature (assoc state :feature (feature-from-comment comment (:feature state)))
+              state-with-comment (-> state
+                                     (assoc :feature (feature-from-comment comment (:feature state)))
+                                     (update-layer-from-comment comment))
               [next-state maybe-segment]
               (cond
                 (= command "G90")
-                [(assoc state-with-feature :absolute-xyz? true) nil]
+                [(assoc state-with-comment :absolute-xyz? true) nil]
 
                 (= command "G91")
-                [(assoc state-with-feature :absolute-xyz? false) nil]
+                [(assoc state-with-comment :absolute-xyz? false) nil]
 
                 (= command "M82")
-                [(assoc state-with-feature :absolute-e? true) nil]
+                [(assoc state-with-comment :absolute-e? true) nil]
 
                 (= command "M83")
-                [(assoc state-with-feature :absolute-e? false) nil]
+                [(assoc state-with-comment :absolute-e? false) nil]
 
                 (= command "G92")
-                [(merge state-with-feature
-                        (select-keys (next-position state-with-feature word-map) [:x :y :z :e]))
+                [(merge state-with-comment
+                        (select-keys (next-position state-with-comment word-map) [:x :y :z :e]))
                  nil]
 
                 (#{"G0" "G00" "G1" "G01"} command)
-                (let [next-pos (next-position state-with-feature word-map)
-                      moved-state (-> state-with-feature
-                                      (update-layer (:z next-pos))
+                (let [next-pos (next-position state-with-comment word-map)
+                      moved-state (-> state-with-comment
+                                      (update-layer-from-z (:z next-pos))
                                       (merge next-pos))
-                      segment (move-segment state-with-feature
+                      segment (move-segment state-with-comment
                                             next-pos
                                             line-number
                                             offset
@@ -162,7 +199,7 @@
                   [moved-state segment])
 
                 :else
-                [state-with-feature nil])
+                [state-with-comment nil])
               segment (when maybe-segment
                         (assoc maybe-segment :index (count segments)))]
           (recur (rest remaining)

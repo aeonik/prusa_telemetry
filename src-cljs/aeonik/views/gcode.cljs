@@ -23,6 +23,18 @@
    [:span label]
    [:strong value]])
 
+(defn- layer-display [gcode-data segment]
+  (let [layer (:layer segment)
+        total-layers (:total-layers gcode-data)]
+    (cond
+      (and (number? layer) (number? total-layers))
+      (str (inc layer) " / " total-layers)
+
+      (number? layer)
+      (str (inc layer))
+
+      :else "--")))
+
 (defn- svg-num [n]
   (if (number? n) (.toFixed n 3) "0"))
 
@@ -214,7 +226,7 @@
                            (format-number sdpos)
                            "--")]
      [print-stat "line" (or (:line-number segment) "--")]
-     [print-stat "layer" (or (:layer segment) "--")]
+     [print-stat "layer" (layer-display gcode-data segment)]
      [print-stat "feature" (or (:feature segment) "--")]
      [print-stat "moves" (str (count segments))]
      [print-stat "lines" (str (:line-count gcode-data))]
