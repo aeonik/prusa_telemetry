@@ -13,6 +13,7 @@
    [clojure.string :as str]))
 
 (def ^:private prints-dir (io/file "telemetry-data" "prints"))
+(def ^:private prusalink-request-error "PrusaLink request failed")
 
 ;; Track active prints per sender:
 ;; {sender {:filename "..." :save-filename "..." :job-id 123 :last-packet-time <timestamp>}}
@@ -28,12 +29,44 @@
 (def ^:private missing-print-filename ::missing-print-filename)
 (def ^:private prusalink-poll-interval-ms 1000)
 
-(defn- ensure-prints-dir! 
+(defn- ensure-prints-dir!
   "Ensure the prints directory exists"
   []
   (when-not (.exists prints-dir)
     (.mkdirs prints-dir)
     (println "Created prints directory:" (.getAbsolutePath prints-dir))))
+
+(defn- child-path?
+  "Return true when child resolves inside base after canonicalization."
+  [base child]
+  (let [base-path (.getCanonicalPath base)
+        child-path (.getCanonicalPath child)
+        base-prefix (str base-path java.io.File/separator)]
+    (or (= child-path base-path)
+        (str/starts-with? child-path base-prefix))))
+
+(defn- valid-archive-date?
+  "Return true when date is a telemetry archive date directory."
+  [date]
+  (boolean (re-matches #"\d{4}-\d{2}-\d{2}" (or date ""))))
+
+(defn- valid-archive-filename?
+  "Return true when filename is a single EDN archive filename."
+  [filename]
+  (and (string? filename)
+       (str/ends-with? filename ".edn")
+       (not (str/blank? filename))
+       (not (str/includes? filename "/"))
+       (not (str/includes? filename "\\"))))
+
+(defn- archive-file
+  "Return a canonicalized archive file when date and filename are safe."
+  [date filename]
+  (when (and (valid-archive-date? date)
+             (valid-archive-filename? filename))
+    (let [file (io/file prints-dir date filename)]
+      (when (child-path? prints-dir file)
+        file))))
 
 (defn- normalize-print-filename
   "Normalize the firmware print filename metric.
@@ -60,6 +93,19 @@
          (str/replace #"\.+$" "")
          (str/trim)))))
 
+(defn- archive-file-for-save!
+  "Return the archive file for a print filename and create its date directory."
+  [print-filename]
+  (when-let [sanitized-name (sanitize-filename print-filename)]
+    (let [now (java.util.Date.)
+          date-fmt (java.text.SimpleDateFormat. "yyyy-MM-dd")
+          date-str (.format date-fmt now)
+          filename (str sanitized-name ".edn")
+          file (archive-file date-str filename)]
+      (when file
+        (.mkdirs (.getParentFile file))
+        file))))
+
 (defn- metric-value
   "Extract a metric value from either :value or structured fields."
   [metric]
@@ -69,7 +115,7 @@
           (or (get fields "value")
               (first (vals fields)))))))
 
-(defn- get-print-filename 
+(defn- get-print-filename
   "Extract raw print_filename from metrics.
    Returns `missing-print-filename` when the metric is absent so an explicit
    blank filename can be distinguished from no filename update."
@@ -217,10 +263,11 @@
                :error (str "HTTP " status)
                :updated-at (System/currentTimeMillis))))
     (catch Exception e
+      (println "PrusaLink print-state poll failed:" (.getMessage e))
       (swap! prusalink-print-state assoc
              :available? false
              :active? nil
-             :error (.getMessage e)
+             :error prusalink-request-error
              :updated-at (System/currentTimeMillis)))))
 
 (defn- start-prusalink-print-state-poller!
@@ -241,13 +288,8 @@
   [packet print-filename]
   (try
     (ensure-prints-dir!)
-    (if-let [sanitized-name (sanitize-filename print-filename)]
-      (let [now (java.util.Date.)
-            date-fmt (java.text.SimpleDateFormat. "yyyy-MM-dd")
-            date-str (.format date-fmt now)
-            date-dir (io/file prints-dir date-str)
-            _ (.mkdirs date-dir)
-            print-file (io/file date-dir (str sanitized-name ".edn"))]
+    (if-let [print-file (archive-file-for-save! print-filename)]
+      (do
         (with-open [writer (io/writer print-file :append true)]
           (binding [*print-length* nil
                     *print-level* nil
@@ -412,14 +454,14 @@
   [_req]
   (try
     (ensure-prints-dir!)
-    (let [date-dirs (filter #(and (.isDirectory %) 
+    (let [date-dirs (filter #(and (.isDirectory %)
                                   (re-matches #"\d{4}-\d{2}-\d{2}" (.getName %)))
-                           (.listFiles prints-dir))
+                            (or (.listFiles prints-dir) []))
           files-by-date (reduce (fn [acc date-dir]
                                  (let [date (.getName date-dir)
                                        edn-files (filter #(and (.isFile %)
                                                                (str/ends-with? (.getName %) ".edn"))
-                                                        (.listFiles date-dir))
+                                                        (or (.listFiles date-dir) []))
                                        file-info (map (fn [f]
                                                        {:date date
                                                         :filename (.getName f)
@@ -438,7 +480,7 @@
       (.printStackTrace e)
       {:status 500
        :headers {"Content-Type" "application/json"}
-       :body (json/write-str {:error (.getMessage e)})})))
+       :body (json/write-str {:error "Unable to list telemetry files"})})))
 
 (defn load-telemetry-file-handler
   "Load a telemetry data file by date and filename.
@@ -450,20 +492,28 @@
           match (re-matches #"/api/telemetry-file/([^/]+)/(.+)" uri)]
       (if match
         (let [[_ date filename] match
-              file-path (io/file prints-dir date filename)]
-          (if (and (.exists file-path) (.isFile file-path))
+              file-path (archive-file date filename)]
+          (cond
+            (nil? file-path)
+            {:status 400
+             :headers {"Content-Type" "application/json"}
+             :body (json/write-str {:error "Invalid archive path"})}
+
+            (and (.exists file-path) (.isFile file-path))
             ;; Read packets line by line - they're already in correct format
             (let [packets (with-open [reader (io/reader file-path)]
-                           (doall (keep (fn [line]
-                                         (try
-                                           (edn/read-string line)
-                                           (catch Exception e
-                                             (println "Error reading line:" (.getMessage e))
-                                             nil)))
-                                       (line-seq reader))))]
+                            (doall (keep (fn [line]
+                                           (try
+                                             (edn/read-string line)
+                                             (catch Exception e
+                                               (println "Error reading line:" (.getMessage e))
+                                               nil)))
+                                         (line-seq reader))))]
               {:status 200
                :headers {"Content-Type" "application/json"}
                :body (json/write-str packets)})
+
+            :else
             {:status 404
              :headers {"Content-Type" "application/json"}
              :body (json/write-str {:error "File not found"})}))
@@ -475,7 +525,7 @@
       (.printStackTrace e)
       {:status 500
        :headers {"Content-Type" "application/json"}
-       :body (json/write-str {:error (.getMessage e)})})))
+       :body (json/write-str {:error "Unable to load telemetry file"})})))
 
 (defn- setup-packet-saving-consumer
   "Set up a single consumer for saving packets (runs once per packet, not per WebSocket client).
@@ -550,12 +600,12 @@
                    "Cache-Control" "no-cache"}
          :body body})
       (catch Exception e
+        (println "PrusaLink proxy request failed:" (.getMessage e))
         {:status 502
          :headers {"Content-Type" "application/json"
                    "Cache-Control" "no-cache"}
          :body (json/write-str
-                {:error (.getMessage e)
-                 :auth (prusalink-auth/auth-status)})}))))
+                {:error prusalink-request-error})}))))
 
 (defn- first-header
   "Return the first header value from a PrusaLink response header map."
@@ -582,10 +632,11 @@
                      "Cache-Control" "no-cache"}
            :body body})
         (catch Exception e
+          (println "PrusaLink media proxy request failed:" (.getMessage e))
           {:status 502
            :headers {"Content-Type" "application/json"
                      "Cache-Control" "no-cache"}
-           :body (json/write-str {:error (.getMessage e)})})))))
+           :body (json/write-str {:error prusalink-request-error})})))))
 
 (defn- js-asset-handler
   "Serve compiled ClojureScript assets from resources/js for direct backend access."
@@ -695,7 +746,7 @@
         (.printStackTrace e)
         {:status 500
          :headers {"Content-Type" "text/plain"}
-         :body (str "Server error: " (.getMessage e))}))))
+         :body "Server error"}))))
 
 (defn- start-http-server
   "Start the HTTP server with the given handler and port"

@@ -1,5 +1,7 @@
 (ns aeonik.web-server-test
   (:require [aeonik.web-server :as web]
+            [aeonik.prusalink :as prusalink]
+            [clojure.data.json :as json]
             [clojure.test :refer :all]))
 
 (defn- packet
@@ -20,6 +22,30 @@
            (str (#'web/sanitize-filename
                  "\"OpenSCAD Model_0.4n_0.2mm_PP_Prusa MK4S_20m44s.")
                 ".edn")))))
+
+(deftest archive-path-canonicalization
+  (testing "Valid archive paths resolve under the archive root"
+    (is (some? (#'web/archive-file "2026-06-15" "print.edn"))))
+  (testing "Traversal and invalid archive names are rejected"
+    (is (nil? (#'web/archive-file "../config" "prusalink.edn")))
+    (is (nil? (#'web/archive-file "2026-06-15" "../config/prusalink.edn")))
+    (is (nil? (#'web/archive-file "2026-06-15/.." "print.edn")))
+    (is (nil? (#'web/archive-file "2026-06-15" "print.gcode")))))
+
+(deftest telemetry-file-handler-rejects-traversal
+  (let [response (#'web/load-telemetry-file-handler
+                  {:uri "/api/telemetry-file/2026-06-15/../../config/prusalink.edn"})
+        body (json/read-str (:body response) :key-fn keyword)]
+    (is (= 400 (:status response)))
+    (is (= {:error "Invalid archive path"} body))))
+
+(deftest prusalink-proxy-errors-are-public-safe
+  (with-redefs [prusalink/request (fn [_]
+                                    (throw (ex-info "http://printer.local private detail" {})))]
+    (let [response ((#'web/prusalink-proxy-handler "/api/v1/status") {})
+          body (json/read-str (:body response) :key-fn keyword)]
+      (is (= 502 (:status response)))
+      (is (= {:error "PrusaLink request failed"} body)))))
 
 (deftest packet-saving-tracks-active-print
   (reset! (var-get #'web/active-prints) {})
