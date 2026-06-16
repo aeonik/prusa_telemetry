@@ -362,6 +362,25 @@
         (assoc-in [:prusalink :last-print-state-updated] (:received-at ev))
         (assoc-in [:prusalink :error] nil))
 
+    :prusalink/stream-state
+    (let [data (:data ev)
+          status (:status data)
+          job (:job data)
+          print-state (dissoc data :status :job)
+          connection (cond
+                       (:available? data) :connected
+                       (:error data) :error
+                       :else :unknown)]
+      (-> state
+          (assoc-in [:prusalink :connection] connection)
+          (assoc-in [:prusalink :status] status)
+          (assoc-in [:prusalink :job] job)
+          (assoc-in [:prusalink :print-state] print-state)
+          (assoc-in [:prusalink :last-updated] (:received-at ev))
+          (assoc-in [:prusalink :last-job-updated] (:received-at ev))
+          (assoc-in [:prusalink :last-print-state-updated] (:received-at ev))
+          (assoc-in [:prusalink :error] (:error data))))
+
     :prusalink/error
     (-> state
         (assoc-in [:prusalink :connection] :error)

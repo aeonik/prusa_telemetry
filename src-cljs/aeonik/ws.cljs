@@ -9,7 +9,11 @@
 
 (defn- parse-ws-message [data]
   (try
-    (let [sender (aget data "sender")
+    (if (= "prusalink/state" (aget data "event"))
+      {:type :prusalink/stream-state
+       :data (js->clj (aget data "data") :keywordize-keys true)
+       :received-at (.now js/Date)}
+      (let [sender (aget data "sender")
           metrics (aget data "metrics")
           wall-time-str (aget data "wall-time-str")
           prelude-obj (aget data "prelude")
@@ -56,7 +60,7 @@
        :wall-time-str wall-time-str
        :prelude prelude
        :received-at received-at
-       :print-filename print-filename})
+       :print-filename print-filename}))
     (catch :default e
       (js/console.error "Error parsing WebSocket message:" e)
       (throw e))))

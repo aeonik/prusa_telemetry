@@ -30,3 +30,15 @@
   (let [ws (s/stream 1)]
     (s/close! ws)
     (is (false? @(ws-bridge/send-packet! ws (packet) 10)))))
+
+(deftest send-prusalink-state-wraps-dashboard-event
+  (let [ws (s/stream 1)
+        delivered? @(ws-bridge/send-prusalink-state! ws {:available? true
+                                                         :active? false} 1000)
+        body @(s/take! ws)
+        decoded (json/read-str body :key-fn keyword)]
+    (is (true? delivered?))
+    (is (= "prusalink/state" (:event decoded)))
+    (is (= {:available? true
+            :active? false}
+           (:data decoded)))))

@@ -28,10 +28,14 @@
   (fn [_req]
     (try
       (let [{:keys [status body]} (prusalink/request target-path)]
-        {:status status
+        {:status (if (str/blank? (or body ""))
+                   200
+                   status)
          :headers {"Content-Type" "application/json"
                    "Cache-Control" "no-cache"}
-         :body body})
+         :body (if (str/blank? (or body ""))
+                 (json/write-str {})
+                 body)})
       (catch Exception e
         (println "PrusaLink proxy request failed:" (.getMessage e))
         {:status 502

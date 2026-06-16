@@ -61,8 +61,8 @@
     (ensure-timeline-selection!)
     (init-timeline!)
     (when-not replay-page?
-      (ws/connect-websocket!)
-      (prusalink/start-polling!))
+      (prusalink/stop-polling!)
+      (ws/connect-websocket!))
     ;; Fetch available files on initialization
     (files/fetch-available-files!)
     (case path

@@ -16,3 +16,21 @@
     (is (re-matches #"job-229_run-.+" (:run-id first-state)))
     (is (re-matches #"job-229_run-.+" (:run-id second-state)))
     (is (not= (:run-id first-state) (:run-id second-state)))))
+
+(deftest prusalink-refresh-includes-active-job-snapshot
+  (let [state-atom (atom state/initial-state)]
+    (state/refresh! state-atom
+                    {:status-fn (fn []
+                                  {:status 200
+                                   :json {:printer {:state "PRINTING"}
+                                          :job {:id 231
+                                                :progress 12.5
+                                                :time_printing 30}}})
+                     :job-fn (fn []
+                               {:status 200
+                                :json {:id 231
+                                       :file {:display_name "part.gcode"}}})})
+    (is (true? (:available? @state-atom)))
+    (is (true? (:active? @state-atom)))
+    (is (= "part.gcode" (get-in @state-atom [:job :file :display_name])))
+    (is (= "PRINTING" (get-in @state-atom [:status :printer :state])))))

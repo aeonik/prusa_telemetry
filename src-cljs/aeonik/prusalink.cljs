@@ -10,6 +10,8 @@
 (defonce job-poller (atom nil))
 (defonce print-state-poller (atom nil))
 
+(declare stop-polling!)
+
 (defn- fetch-json!
   "Fetch JSON from a local backend endpoint and dispatch a success event."
   [url success-type & [{:keys [not-found-type]}]]
@@ -57,17 +59,12 @@
   (fetch-json! "/api/prusalink/print-state" :prusalink/print-state-success))
 
 (defn start-polling!
-  "Start PrusaLink API polling for dashboard metadata."
+  "Deprecated compatibility hook.
+
+   PrusaLink dashboard metadata now arrives through the main WebSocket stream.
+   Calling this only clears any legacy timers left alive by a hot reload."
   []
-  (when-not @status-poller
-    (fetch-status!)
-    (reset! status-poller (js/setInterval fetch-status! status-poll-ms)))
-  (when-not @job-poller
-    (fetch-job!)
-    (reset! job-poller (js/setInterval fetch-job! job-poll-ms)))
-  (when-not @print-state-poller
-    (fetch-print-state!)
-    (reset! print-state-poller (js/setInterval fetch-print-state! print-state-poll-ms))))
+  (stop-polling!))
 
 (defn stop-polling!
   "Stop PrusaLink API polling."

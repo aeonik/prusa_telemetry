@@ -263,7 +263,9 @@
    "/dashboard" #'dashboard-handler
    "/replay" #'dashboard-handler
    "/ws" (fn [req]
-           ((ws-bridge/websocket-handler telemetry-stream) req))
+           ((ws-bridge/websocket-handler telemetry-stream
+                                             {:prusalink-state prusalink-print-state})
+            req))
    "/api/telemetry-files" #'list-telemetry-files-handler
    "/api/prusalink/auth" #'prusalink-proxy/auth-status-handler
    "/api/prusalink/print-state" (fn [req]

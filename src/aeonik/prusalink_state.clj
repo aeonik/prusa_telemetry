@@ -5,6 +5,8 @@
   {:available? false
    :active? nil
    :run-id nil
+   :status nil
+   :job nil
    :updated-at nil})
 
 (def request-error "PrusaLink request failed")
@@ -57,27 +59,72 @@
       :time-printing (:time_printing job)
       :updated-at now-ms})))
 
+(defn- refresh-options
+  [opts-or-status-fn]
+  (if (fn? opts-or-status-fn)
+    {:status-fn opts-or-status-fn
+     :job-fn prusalink/job}
+    (merge {:status-fn prusalink/status
+            :job-fn prusalink/job}
+           opts-or-status-fn)))
+
+(defn- fetch-active-job
+  [job-fn active?]
+  (when active?
+    (try
+      (let [{:keys [status json]} (job-fn)]
+        (cond
+          (and (<= 200 status 299) json)
+          {:job json}
+
+          (and (<= 200 status 299) (nil? json))
+          {:job nil}
+
+          (= 404 status)
+          {:job nil}
+
+          :else
+          {:job nil
+           :job-error (str "HTTP " status)}))
+      (catch Exception e
+        (println "PrusaLink job poll failed:" (.getMessage e))
+        {:job nil
+         :job-error request-error}))))
+
 (defn refresh!
-  "Poll PrusaLink for the current print state."
+  "Poll PrusaLink for the current dashboard print state."
   ([state-atom]
-   (refresh! state-atom prusalink/status))
-  ([state-atom status-fn]
-   (try
-     (let [{:keys [status json]} (status-fn)]
-       (if (<= 200 status 299)
-         (reset! state-atom (status->print-state json @state-atom))
+   (refresh! state-atom {}))
+  ([state-atom opts-or-status-fn]
+   (let [{:keys [status-fn job-fn]} (refresh-options opts-or-status-fn)]
+     (try
+       (let [{:keys [status json]} (status-fn)]
+         (if (<= 200 status 299)
+           (let [print-state (status->print-state json @state-atom)
+                 {:keys [job job-error]} (fetch-active-job job-fn (:active? print-state))]
+             (reset! state-atom
+                     (cond-> (assoc print-state
+                                    :status json
+                                    :job job
+                                    :error nil)
+                       job-error
+                       (assoc :job-error job-error))))
+           (swap! state-atom assoc
+                  :available? false
+                  :active? nil
+                  :status nil
+                  :job nil
+                  :error (str "HTTP " status)
+                  :updated-at (System/currentTimeMillis))))
+       (catch Exception e
+         (println "PrusaLink print-state poll failed:" (.getMessage e))
          (swap! state-atom assoc
                 :available? false
                 :active? nil
-                :error (str "HTTP " status)
-                :updated-at (System/currentTimeMillis))))
-     (catch Exception e
-       (println "PrusaLink print-state poll failed:" (.getMessage e))
-       (swap! state-atom assoc
-              :available? false
-              :active? nil
-              :error request-error
-              :updated-at (System/currentTimeMillis))))))
+                :status nil
+                :job nil
+                :error request-error
+                :updated-at (System/currentTimeMillis)))))))
 
 (defn start-poller!
   "Start polling PrusaLink print state.
