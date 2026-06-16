@@ -66,10 +66,12 @@
           (compute-packet-range timeline-data current-filename)))))
 
 (defn- packet-range-span
-  [{:keys [min max]}]
-  (if (and (number? min) (number? max))
-    (max 0 (- max min))
-    0))
+  [packet-range]
+  (let [range-min (:min packet-range)
+        range-max (:max packet-range)]
+    (if (and (number? range-min) (number? range-max))
+      (cljs.core/max 0 (- range-max range-min))
+      0)))
 
 (defn- playback-step
   "Return the packet-msg increment per playback tick."

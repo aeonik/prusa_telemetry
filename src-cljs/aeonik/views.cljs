@@ -92,6 +92,25 @@
    [:span " → "]
    [:span {:class "time-max"} (str (:max packet-range))]])
 
+(defonce timeline-scrub-frame (atom nil))
+(defonce timeline-scrub-packet-msg (atom nil))
+
+(defn- dispatch-timeline-packet-msg!
+  "Coalesce high-frequency slider input to one state update per animation frame."
+  [packet-msg]
+  (when (and (number? packet-msg) (not (js/isNaN packet-msg)))
+    (reset! timeline-scrub-packet-msg packet-msg)
+    (when-not @timeline-scrub-frame
+      (reset! timeline-scrub-frame
+              (js/requestAnimationFrame
+               (fn []
+                 (let [next-msg @timeline-scrub-packet-msg]
+                   (reset! timeline-scrub-frame nil)
+                   (reset! timeline-scrub-packet-msg nil)
+                   (when (and (number? next-msg) (not (js/isNaN next-msg)))
+                     (dispatch! {:type :timeline/set-packet-msg
+                                 :packet-msg next-msg})))))))))
+
 (defn- timeline-slider
   "Timeline slider works with packet msg numbers.
    Step is 1 packet."
@@ -109,13 +128,11 @@
              :on-change (fn [e]
                          (let [target (.-target e)
                                new-msg (js/parseInt (.-value target))]
-                           (when (not (js/isNaN new-msg))
-                             (dispatch! {:type :timeline/set-packet-msg :packet-msg new-msg}))))
+                           (dispatch-timeline-packet-msg! new-msg)))
              :on-input (fn [e]
                         (let [target (.-target e)
                               new-msg (js/parseInt (.-value target))]
-                          (when (not (js/isNaN new-msg))
-                            (dispatch! {:type :timeline/set-packet-msg :packet-msg new-msg}))))}]))
+                          (dispatch-timeline-packet-msg! new-msg)))}]))
 
 (defn- timeline-packet-display
   "Display current packet msg number and progress percentage."
@@ -717,16 +734,26 @@
 
 (def ^:private replay-spark-window 120)
 
+(defn- sample-number [sample]
+  (let [value (:value sample)]
+    (when (te/finite-number? value)
+      value)))
+
 (defn- replay-metric-card [summary current-packet-msg]
   (let [latest (:latest summary)
-        selected (replay-index/event-at-or-before summary current-packet-msg)
-        window-events (replay-index/event-window-at summary current-packet-msg replay-spark-window)
-        numeric-values (keep te/metric-number window-events)
+        selected-sample (replay-index/sample-at-or-before summary current-packet-msg)
+        window-samples (replay-index/sample-window-at summary current-packet-msg replay-spark-window)
+        numeric-values (keep sample-number window-samples)
         numeric? (:numeric? summary)
         stats (metric-stats numeric-values)
         selected-value (cond
-                         (and numeric? selected) (format-dashboard-number (te/metric-number selected))
-                         selected (u/format-metric-value selected)
+                         (and numeric? selected-sample)
+                         (format-dashboard-number (sample-number selected-sample))
+
+                         selected-sample
+                         (u/format-metric-value
+                          (replay-index/sample->event summary selected-sample))
+
                          :else "--")
         sender (:sender latest)
         metric-name (:name latest)]
@@ -749,7 +776,9 @@
          [stat-cell "delta" (format-dashboard-number (:delta stats))]]
         [:<>
          [stat-cell "samples" (str (or (:event-count summary) 0))]
-         [stat-cell "seen" (if selected (str (:packet-msg selected)) "--")]])]]))
+         [stat-cell "seen" (if selected-sample
+                              (str (:packet-msg selected-sample))
+                              "--")]])]]))
 
 (defn- replay-toolpath-panel [gcode-data replay-data packet-range current-packet-msg]
   [gcode-view/replay-toolpath-panel
