@@ -7,8 +7,7 @@
             [aeonik.files :as files]
             [aeonik.gcode :as gcode]
             [aeonik.views.gcode :as gcode-view]
-            [clojure.string :as str]
-            [reagent.core :as r]))
+            [clojure.string :as str]))
 
 (defn status-view [_app-state]
   (let [connected? (= (:connection _app-state) :connected)]
@@ -279,8 +278,7 @@
         ;; Update state if packet-msg is out of range
         _ (when (and packet-range current-packet-msg
                      (not= current-packet-msg (:selected-packet-msg app-state-val)))
-            (r/after-render #(dispatch! {:type :timeline/set-packet-msg
-                                          :packet-msg current-packet-msg})))
+            (js/setTimeout #(dispatch! {:type :timeline/set-packet-msg :packet-msg current-packet-msg}) 0))
         metrics-at-packet (if (and print-filename current-packet-msg packet-range
                                    (>= current-packet-msg (:min packet-range))
                                    (<= current-packet-msg (:max packet-range)))
@@ -854,13 +852,13 @@
             (when-let [file-info (first (filter #(= selected-run (str (:date %) ":" (:filename %)))
                                                 available-files))]
               (reset! replay-autoload-run selected-run)
-              (r/after-render #(files/load-telemetry-file-replace (:date file-info)
-                                                                  (:filename file-info)
-                                                                  (:size file-info)))))
+              (js/setTimeout #(files/load-telemetry-file-replace (:date file-info)
+                                                                 (:filename file-info)
+                                                                 (:size file-info))
+                             0)))
         _ (when (and packet-range current-packet-msg
                      (not= current-packet-msg (:selected-packet-msg app-state)))
-            (r/after-render #(dispatch! {:type :timeline/set-packet-msg
-                                          :packet-msg current-packet-msg})))
+            (js/setTimeout #(dispatch! {:type :timeline/set-packet-msg :packet-msg current-packet-msg}) 0))
         packet (replay-packet-at replay-data current-packet-msg)
         metrics-at-packet (replay-index/events-at-packet replay-data current-packet-msg)
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (te/metric-display-name m))) metrics-at-packet)
