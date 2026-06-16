@@ -1,5 +1,6 @@
 (ns aeonik.events
   (:require [aeonik.state :refer [app-state] :as state]
+            [aeonik.replay.index :as replay-index]
             [aeonik.telemetry-events :as te]
             [aeonik.timeline :as timeline]))
 
@@ -44,7 +45,6 @@
 (def ^:private batch-size 100) ; Process packets in batches to avoid blocking UI
 (def ^:private live-event-limit 12000)
 (def ^:private replay-batch-size 250)
-(def ^:private replay-sample-limit 180)
 
 ;; Atom to track batch processing state
 (defonce batch-processing-state (atom nil))
@@ -121,107 +121,10 @@
           (-> (load-telemetry-packets-batch state packets)
               (ensure-timeline-selection nil)))))))
 
-(defn- append-replay-sample [samples value]
-  (let [samples (conj (or samples []) value)]
-    (if (> (count samples) (* 2 replay-sample-limit))
-      (vec (take-nth 2 samples))
-      samples)))
-
-(defn- update-replay-summary [summary event]
-  (let [value (te/metric-number event)
-        summary (-> (or summary {})
-                    (assoc :key (te/metric-key event)
-                           :sender (:sender event)
-                           :name (:name event)
-                           :type (:type event)
-                           :latest event
-                           :history (conj (or (:history summary) []) event)))]
-    (let [summary (update summary :event-count (fnil inc 0))]
-    (if-not (number? value)
-      summary
-      (let [sample-count (inc (or (:sample-count summary) 0))
-            first-value (if (contains? summary :first-value)
-                          (:first-value summary)
-                          value)
-            sum (+ (or (:sum summary) 0) value)]
-        (assoc summary
-               :numeric? true
-               :sample-count sample-count
-               :sum sum
-               :first-value first-value
-               :latest-number value
-               :min (if (number? (:min summary)) (min (:min summary) value) value)
-               :max (if (number? (:max summary)) (max (:max summary) value) value)
-               :samples (append-replay-sample (:samples summary) value)))))))
-
-(defn- replay-summary->card [summary]
-  (let [summary (update summary :history #(vec (sort-by :packet-msg %)))]
-    (if (:numeric? summary)
-      (assoc summary
-             :stats {:latest (:latest-number summary)
-                     :min (:min summary)
-                     :max (:max summary)
-                     :avg (/ (:sum summary) (:sample-count summary))
-                     :delta (- (:latest-number summary) (:first-value summary))
-                     :samples (:sample-count summary)})
-      summary)))
-
-(defn- replay-packet-events [build packet]
-  (let [sender (:sender packet)
-        metrics (:metrics packet)
-        wall-time-str (:wall-time-str packet)
-        prelude (:prelude packet)
-        packet-msg (or (:msg prelude) (:packet-count build))
-        received-at (:received-at packet)
-        print-filename (or (te/extract-print-filename-from-metrics metrics)
-                           (:print-filename build))]
-    {:packet-msg packet-msg
-     :received-at received-at
-     :wall-time-str wall-time-str
-     :print-filename print-filename
-     :events (te/create-events sender metrics wall-time-str print-filename packet-msg received-at)}))
-
-(defn- add-replay-packet [build packet]
-  (let [{:keys [packet-msg events print-filename] :as replay-packet} (replay-packet-events build packet)
-        packet-index (count (:packets build))
-        summaries (reduce (fn [acc event]
-                            (let [key (te/metric-key event)]
-                              (update acc key update-replay-summary event)))
-                          (:summaries build)
-                          events)
-        updated-build (cond-> (-> build
-                                  (update :packet-count inc)
-                                  (update :packets conj replay-packet)
-                                  (assoc-in [:packet-index packet-msg] packet-index)
-                                  (assoc :summaries summaries))
-                        print-filename
-                        (assoc :print-filename print-filename))]
-    (if (number? packet-msg)
-      (-> updated-build
-          (update :min-msg #(if (number? %) (min % packet-msg) packet-msg))
-          (update :max-msg #(if (number? %) (max % packet-msg) packet-msg)))
-      updated-build)))
-
-(defn- finalize-replay-data [build]
-  (let [cards (->> (vals (:summaries build))
-                   (map replay-summary->card)
-                   vec)
-        packet-range (when (and (number? (:min-msg build))
-                                (number? (:max-msg build)))
-                       {:min (:min-msg build)
-                        :max (:max-msg build)})]
-    {:archive (:archive build)
-     :print-filename (:print-filename build)
-     :packet-count (:packet-count build)
-     :packet-range packet-range
-     :packets (:packets build)
-     :packet-index (:packet-index build)
-     :metric-cards cards}))
-
 (defn- process-replay-batches! [build batches batch-index token]
   (when (= token (:token @batch-processing-state))
     (if (>= batch-index (count batches))
-      (let [data (finalize-replay-data build)
+      (let [data (replay-index/finalize build)
             start-msg (get-in data [:packet-range :min])]
         (swap! app-state
                (fn [state]
@@ -233,7 +136,7 @@
                      (assoc-in [:replay :load-progress] nil)
                      (assoc-in [:replay :data] data)
                      (assoc-in [:replay :error] nil)))))
-      (let [updated-build (reduce add-replay-packet build (nth batches batch-index))]
+      (let [updated-build (reduce replay-index/add-packet build (nth batches batch-index))]
         (swap! app-state
                (fn [state]
                  (-> state
@@ -250,16 +153,7 @@
 (defn- process-replay-packets! [archive packets]
   (let [packets (if (vector? packets) packets (vec packets))
         token (str archive ":" (.now js/Date))
-        batches (vec (partition-all replay-batch-size packets))
-        build {:archive archive
-               :total (count packets)
-               :packet-count 0
-               :packets []
-               :packet-index {}
-               :summaries {}
-               :print-filename nil
-               :min-msg nil
-               :max-msg nil}]
+        batches (vec (partition-all replay-batch-size packets))]
     (reset! batch-processing-state {:token token})
     (swap! app-state
            (fn [state]
@@ -273,7 +167,11 @@
                  (assoc-in [:replay :load-progress] {:processed 0 :total (count packets)})
                  (assoc-in [:replay :data] nil)
                  (assoc-in [:replay :error] nil))))
-    (js/setTimeout #(process-replay-batches! build batches 0 token) 0)))
+    (js/setTimeout #(process-replay-batches! (replay-index/empty-build archive (count packets))
+                                             batches
+                                             0
+                                             token)
+                   0)))
 
 (defn- handle-ws-message
   [state {:keys [sender metrics wall-time-str print-filename prelude received-at]}]

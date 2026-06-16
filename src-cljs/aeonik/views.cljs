@@ -2,6 +2,7 @@
   (:require [aeonik.util :as u]
             [aeonik.events :refer [dispatch!]]
             [aeonik.telemetry-events :as te]
+            [aeonik.replay.index :as replay-index]
             [aeonik.state :as state :refer [app-state]]
             [aeonik.files :as files]
             [aeonik.gcode :as gcode]
@@ -664,28 +665,6 @@
       gcode-file-name (str "Previous G-code: " gcode-file-name)
       :else "No G-code loaded")]])
 
-(defn- normalize-timeline-name [value]
-  (-> (str value)
-      (str/replace #"^[\"']+" "")
-      (str/replace #"[\"']+$" "")
-      (str/trim)
-      (str/replace #"^[^:]+:" "")
-      (str/replace #"^_" "")
-      (str/replace #"\.edn$" "")))
-
-(defn- replay-print-filename [timeline-data selected-filename]
-  (let [timeline-filenames (keys timeline-data)]
-    (or (when (and selected-filename (seq timeline-filenames))
-          (let [normalized-selected (normalize-timeline-name selected-filename)]
-            (some #(when (= normalized-selected (normalize-timeline-name %)) %) timeline-filenames)))
-        (first timeline-filenames))))
-
-(defn- packet-range-for [packets]
-  (when (seq packets)
-    (let [msg-numbers (map :packet-msg packets)]
-      {:min (apply min msg-numbers)
-       :max (apply max msg-numbers)})))
-
 (defn- current-packet-msg-for [selected-packet-msg packet-range]
   (when packet-range
     (if (and selected-packet-msg
@@ -711,30 +690,12 @@
             metric))
         metrics))
 
-(defn- last-history-index-at [history packet-msg]
-  (when (and (seq history) (number? packet-msg))
-    (let [history (if (vector? history) history (vec history))]
-      (loop [lo 0
-             hi (dec (count history))
-             best nil]
-        (if (> lo hi)
-          best
-          (let [mid (js/Math.floor (/ (+ lo hi) 2))
-                event (nth history mid)
-                event-msg (:packet-msg event)]
-            (if (and (number? event-msg) (<= event-msg packet-msg))
-              (recur (inc mid) hi mid)
-              (recur lo (dec mid) best))))))))
-
 (def ^:private sdpos-metric-names
   #{"sdpos" "sd_pos" "file_position" "gcode_offset" "gcode_pos"})
 
 (defn- metric-at-or-before [metric-cards names packet-msg]
   (when-let [summary (metric-by-names metric-cards names)]
-    (let [history (vec (or (:history summary) []))
-          idx (last-history-index-at history packet-msg)]
-      (when (number? idx)
-        (nth history idx)))))
+    (replay-index/event-at-or-before summary packet-msg)))
 
 (defn- replay-correlation [gcode-data replay-data packet-range current-packet-msg]
   (let [segments (:segments gcode-data)
@@ -754,33 +715,12 @@
      :segment-index segment-index
      :mode (if sdpos "sdpos" "packet ratio")}))
 
-(defn- sample-values [values limit]
-  (let [values (vec values)
-        sample-count (count values)]
-    (if (<= sample-count limit)
-      values
-      (let [step (/ sample-count limit)]
-        (vec
-         (map (fn [idx]
-                (nth values (min (dec sample-count)
-                                 (js/Math.floor (* idx step)))))
-              (range limit)))))))
-
 (def ^:private replay-spark-window 120)
-
-(defn- history-window-at [history idx limit]
-  (if (and (number? idx) (vector? history))
-    (let [end (inc idx)
-          start (max 0 (- end limit))]
-      (subvec history start end))
-    []))
 
 (defn- replay-metric-card [summary current-packet-msg]
   (let [latest (:latest summary)
-        history (vec (or (:history summary) []))
-        history-idx (last-history-index-at history current-packet-msg)
-        selected (when (number? history-idx) (nth history history-idx))
-        window-events (history-window-at history history-idx replay-spark-window)
+        selected (replay-index/event-at-or-before summary current-packet-msg)
+        window-events (replay-index/event-window-at summary current-packet-msg replay-spark-window)
         numeric-values (keep te/metric-number window-events)
         numeric? (:numeric? summary)
         stats (metric-stats numeric-values)
@@ -820,9 +760,7 @@
 (defonce replay-autoload-run (atom nil))
 
 (defn- replay-packet-at [replay-data packet-msg]
-  (when (and replay-data packet-msg)
-    (get (:packets replay-data)
-         (get (:packet-index replay-data) packet-msg))))
+  (replay-index/packet-at replay-data packet-msg))
 
 (defn- replay-load-status [{:keys [loading? load-progress error]}]
   (cond
@@ -844,6 +782,11 @@
 
     :else
     nil))
+
+(defn- replay-index-summary-label [replay-data]
+  (if-let [{:keys [packets metric-series metric-samples]} (:memory-summary replay-data)]
+    (str packets " packets / " metric-series " series / " metric-samples " samples")
+    "no run"))
 
 (defn replay-view [app-state]
   (let [available-files (:available-files app-state)
@@ -869,7 +812,7 @@
                      (not= current-packet-msg (:selected-packet-msg app-state)))
             (js/setTimeout #(dispatch! {:type :timeline/set-packet-msg :packet-msg current-packet-msg}) 0))
         packet (replay-packet-at replay-data current-packet-msg)
-        metrics-at-packet (or (:events packet) [])
+        metrics-at-packet (replay-index/events-at-packet replay-data current-packet-msg)
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-packet)
         cards (->> (:metric-cards replay-data)
                    (filter #(dashboard-visible-metric? (:latest %)))
@@ -890,7 +833,8 @@
        [:section {:class "replay-metrics-panel"}
         [:div {:class "replay-panel-head"}
          [:h2 "Metrics"]
-         [:span (or print-filename "no run")]]
+         [:span {:title (or print-filename "")}
+          (replay-index-summary-label replay-data)]]
         (cond
           status-view
           status-view
@@ -908,7 +852,11 @@
        [:section {:class "replay-current-panel"}
         [:div {:class "replay-panel-head"}
          [:h2 "Packet"]
-         [:span (if current-packet-msg (str "packet " current-packet-msg) "no packet")]]
+         [:span (if current-packet-msg
+                  (str "packet " current-packet-msg
+                       (when-let [metric-count (:metric-count packet)]
+                         (str " / " metric-count " metrics")))
+                  "no packet")]]
         [timeline-metrics-table sorted-metrics]]]]]))
 
 (defn main-view [app-state]
