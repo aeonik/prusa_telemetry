@@ -10,6 +10,20 @@ This application provides:
 - **Multiple data views**: Latest values table or packet history
 - **Structured data support**: Displays complex metrics like runtime stats, network info, and more
 
+## Screenshots
+
+### Replay Analysis
+
+![Replay dashboard with synchronized G-code toolpath and telemetry metrics](docs/screenshots/replay-dashboard.png)
+
+### Live Metrics Dashboard
+
+![Live metrics dashboard with print status and metric sparklines](docs/screenshots/live-metrics-dashboard.png)
+
+### Tables View
+
+![Telemetry table view with latest metric values](docs/screenshots/tables-view.png)
+
 ## Architecture
 
 The system consists of three main components:
