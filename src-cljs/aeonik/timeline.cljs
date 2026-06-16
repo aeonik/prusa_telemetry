@@ -13,6 +13,7 @@
 
 (defonce timeline-loop (atom nil))
 (defonce dispatch-callback (atom nil))
+(def ^:private replay-target-ticks 1200)
 
 (defn set-dispatch-callback!
   "Set the callback function to use for dispatching events.
@@ -55,27 +56,46 @@
         {:min (apply min msg-numbers)
          :max (apply max msg-numbers)}))))
 
+(defn- active-packet-range
+  "Return the packet range for the active timeline surface."
+  [app-state-val]
+  (or (when (= :replay (:view-mode app-state-val))
+        (get-in app-state-val [:replay :data :packet-range]))
+      (when-let [current-filename (:selected-filename app-state-val)]
+        (let [timeline-data (state/get-timeline-data nil)]
+          (compute-packet-range timeline-data current-filename)))))
+
+(defn- packet-range-span
+  [{:keys [min max]}]
+  (if (and (number? min) (number? max))
+    (max 0 (- max min))
+    0))
+
+(defn- playback-step
+  "Return the packet-msg increment per playback tick."
+  [app-state-val packet-range]
+  (if (= :replay (:view-mode app-state-val))
+    (int (max 1 (js/Math.ceil (/ (packet-range-span packet-range)
+                                  replay-target-ticks))))
+    1))
+
 (defn update-loop!
-  "Check if we need to start/stop the loop based on current app-state.
-   Only recomputes packet-range when filename or events change."
+  "Check if we need to start/stop the loop based on current app-state."
   []
   (let [app-state-val @app-state
         playing (:timeline-playing app-state-val)
-        current-filename (:selected-filename app-state-val)]
-    (if (and playing current-filename)
-      ;; Try to start loop if playing
-      (let [timeline-data (state/get-timeline-data nil) ; Uses cached value
-            packet-range (compute-packet-range timeline-data current-filename)]
-        (if packet-range
-          (start-loop! 1 packet-range) ; Step by 1 packet
-          (stop-loop!)))
-      ;; Stop loop if not playing or no filename
+        packet-range (active-packet-range app-state-val)]
+    (if (and playing packet-range)
+      (start-loop! (playback-step app-state-val packet-range) packet-range)
       (stop-loop!))))
 
 ;; Watch app-state and update loop when relevant state changes
 (add-watch app-state :timeline-loop
            (fn [_ _ old new]
              (when (or (not= (:timeline-playing old) (:timeline-playing new))
-                      (not= (:selected-filename old) (:selected-filename new))
-                      (not= (:telemetry-events old) (:telemetry-events new)))
+                       (not= (:selected-filename old) (:selected-filename new))
+                       (not= (:view-mode old) (:view-mode new))
+                       (not= (get-in old [:replay :data :packet-range])
+                             (get-in new [:replay :data :packet-range]))
+                       (not= (:telemetry-events old) (:telemetry-events new)))
                (update-loop!))))
