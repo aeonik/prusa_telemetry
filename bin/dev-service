@@ -10,6 +10,10 @@ SHADOW_NREPL_PORT="${SHADOW_NREPL_PORT:-9631}"
 TELEMETRY_PORT="${TELEMETRY_PORT:-8514}"
 WEB_PORT="${WEB_PORT:-8080}"
 SHADOW_HTTP_PORT="${SHADOW_HTTP_PORT:-9632}"
+CLJ_EXTRA_ALIASES="${CLJ_EXTRA_ALIASES:-}"
+BACKEND_ALIASES="${BACKEND_ALIASES:-:dev${CLJ_EXTRA_ALIASES}:dev-service}"
+SHADOW_ALIASES="${SHADOW_ALIASES:-:shadow-cljs${CLJ_EXTRA_ALIASES}}"
+SERVICE_CONFIG_FILE="$ROOT/log/dev-service.env"
 
 has_session() {
   tmux has-session -t "$SESSION" 2>/dev/null
@@ -23,6 +27,22 @@ app:           http://localhost:${SHADOW_HTTP_PORT}
 backend HTTP:  http://localhost:${WEB_PORT}
 telemetry UDP: ${TELEMETRY_PORT}
 EOF
+
+  if [[ -f "$SERVICE_CONFIG_FILE" ]]; then
+    cat "$SERVICE_CONFIG_FILE"
+  else
+    cat <<EOF
+backend aliases: ${BACKEND_ALIASES}
+shadow aliases:  ${SHADOW_ALIASES}
+EOF
+  fi
+}
+
+write_service_config() {
+  cat > "$SERVICE_CONFIG_FILE" <<EOF
+backend aliases: ${BACKEND_ALIASES}
+shadow aliases:  ${SHADOW_ALIASES}
+EOF
 }
 
 start_service() {
@@ -33,12 +53,13 @@ start_service() {
   fi
 
   mkdir -p "$ROOT/log"
+  write_service_config
 
   tmux new-session -d -s "$SESSION" -c "$ROOT" -n backend \
-    "env PRUSA_TELEMETRY_AUTO_START=false NREPL_BIND='${NREPL_BIND}' NREPL_PORT='${NREPL_PORT}' TELEMETRY_PORT='${TELEMETRY_PORT}' WEB_PORT='${WEB_PORT}' clojure -M:dev:dev-service 2>&1 | tee -a log/dev-backend.log"
+    "env PRUSA_TELEMETRY_AUTO_START=false NREPL_BIND='${NREPL_BIND}' NREPL_PORT='${NREPL_PORT}' TELEMETRY_PORT='${TELEMETRY_PORT}' WEB_PORT='${WEB_PORT}' clojure -M${BACKEND_ALIASES} 2>&1 | tee -a log/dev-backend.log"
 
   tmux new-window -t "${SESSION}:" -c "$ROOT" -n shadow \
-    "clojure -M:shadow-cljs --config-merge '{:nrepl {:port ${SHADOW_NREPL_PORT}} :dev-http {${SHADOW_HTTP_PORT} {:root \"resources\" :proxy-url \"http://localhost:${WEB_PORT}\"}}}' watch app 2>&1 | tee -a log/dev-shadow.log"
+    "clojure -M${SHADOW_ALIASES} --config-merge '{:nrepl {:port ${SHADOW_NREPL_PORT}} :dev-http {${SHADOW_HTTP_PORT} {:root \"resources\" :proxy-url \"http://localhost:${WEB_PORT}\"}}}' watch app 2>&1 | tee -a log/dev-shadow.log"
 
   echo "Started tmux session: ${SESSION}"
   print_endpoints
@@ -62,6 +83,7 @@ stop_service() {
   done
 
   tmux kill-session -t "$SESSION" 2>/dev/null || true
+  rm -f "$SERVICE_CONFIG_FILE"
   echo "Stopped tmux session: ${SESSION}"
 }
 
@@ -105,6 +127,7 @@ Commands:
   start        Start backend service, backend nREPL, shadow watch, and shadow nREPL
   stop         Stop the tmux-managed dev service
   restart      Stop and start the dev service
+  debug        Restart the dev service with the :clojurestorm alias
   status       Show service status and endpoints
   attach       Attach to the tmux session
   logs         Tail backend and shadow logs
@@ -117,6 +140,9 @@ Environment:
   TELEMETRY_PORT=${TELEMETRY_PORT}
   WEB_PORT=${WEB_PORT}
   SHADOW_HTTP_PORT=${SHADOW_HTTP_PORT}
+  CLJ_EXTRA_ALIASES=${CLJ_EXTRA_ALIASES}    # appended to backend and shadow aliases
+  BACKEND_ALIASES=${BACKEND_ALIASES}
+  SHADOW_ALIASES=${SHADOW_ALIASES}
 EOF
 }
 
@@ -125,6 +151,7 @@ case "$command" in
   start) start_service ;;
   stop) stop_service ;;
   restart) stop_service; start_service ;;
+  debug) stop_service; CLJ_EXTRA_ALIASES="${CLJ_EXTRA_ALIASES:-:clojurestorm}" BACKEND_ALIASES="" SHADOW_ALIASES="" exec "$0" start ;;
   status) status_service ;;
   attach) attach_service ;;
   logs) tail_logs ;;
