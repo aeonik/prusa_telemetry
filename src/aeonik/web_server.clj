@@ -5,6 +5,7 @@
    [manifold.stream :as s]
    [manifold.deferred :as d]
    [aeonik.archive :as archive]
+   [aeonik.config :as config]
    [aeonik.metric-catalog :as metric-catalog]
    [aeonik.prusa-telemetry :as telemetry]
    [aeonik.prusalink-proxy :as prusalink-proxy]
@@ -28,6 +29,18 @@
   (archive/make-state {:prusalink-state prusalink-print-state}))
 
 (alter-var-root #'archive-state current-archive-state-shape)
+
+(defn- configure-archive-state!
+  "Apply runtime archive config to the shared archive service state."
+  [runtime-config]
+  (alter-var-root
+   #'archive-state
+   (fn [state]
+     (assoc state
+            :prints-dir (config/prints-dir runtime-config)
+            :print-end-timeout-ms (config/print-end-timeout-ms runtime-config))))
+  (archive/ensure-prints-dir! archive-state)
+  archive-state)
 
 (defonce ^:private live-handler
   (atom nil))
@@ -387,10 +400,11 @@
 
 (defn- start-http-server
   "Start the HTTP server with the given handler and port"
-  [handler port]
+  [handler {:keys [host port]}]
   (try
-    (println "Attempting to start server on port" port "...")
-    (let [srv (http/start-server handler {:port port})]
+    (println "Attempting to start server on" (str host ":" port) "...")
+    (let [srv (http/start-server handler {:host host
+                                          :port port})]
       (println "Server object created successfully")
       (Thread/sleep 1000) ; Give it time to bind
       (println "Server should be ready, checking status...")
@@ -410,10 +424,12 @@
    
    Returns {:server .. :stop! (fn [])}
    Options:
+   - :host (default 0.0.0.0) - Backend server bind host
    - :port (default 8080) - Backend server port (shadow-cljs proxies to this)
    - :telemetry-stream (required) - the processed stream from telemetry server"
-  [{:keys [port telemetry-stream]
-    :or {port 8080}}]
+  [{:keys [host port telemetry-stream]
+    :or {host "0.0.0.0"
+         port 8080}}]
   (when (nil? telemetry-stream)
     (throw (ex-info "telemetry-stream is required" {})))
 
@@ -425,12 +441,14 @@
   (let [stop-saving-consumer! (setup-packet-saving-consumer telemetry-stream)
         stop-prusalink-poller! (prusalink-state/start-poller! prusalink-print-state)
         _ (reset! live-config {:port port
+                               :host host
                                :telemetry-stream telemetry-stream})
         _ (reload-request-handler!)
-        server (start-http-server live-request-handler port)]
+        server (start-http-server live-request-handler {:host host
+                                                       :port port})]
     
-    (println (format "Web server started on http://localhost:%d" port))
-    (println (format "WebSocket endpoint: ws://localhost:%d/ws" port))
+    (println (format "Web server started on http://%s:%d" host port))
+    (println (format "WebSocket endpoint: ws://%s:%d/ws" host port))
     (println "Waiting for telemetry packets... (make sure your printer is sending UDP packets to port 8514)")
     
     {:server server
@@ -448,15 +466,23 @@
   "Start both telemetry server and web server"
   [& args]
   (let [parse-long? (fn [s] (try (Long/parseLong s) (catch Exception _ nil)))
-        telemetry-port (or (some-> args first parse-long?) 8514)
-        web-port (or (some-> args second parse-long?) 8080)]
+        runtime-config (config/load-config)
+        telemetry-port (or (some-> args first parse-long?)
+                           (config/telemetry-port runtime-config))
+        web-port (or (some-> args second parse-long?)
+                     (config/http-port runtime-config))
+        web-host (config/http-host runtime-config)]
     
     (println "Starting Prusa telemetry system...")
-    (println (format "Telemetry UDP port: %d" telemetry-port))
-    (println (format "Web server port: %d" web-port))
+    (config/print-startup-summary!
+     (-> runtime-config
+         (assoc-in [:telemetry :port] telemetry-port)
+         (assoc-in [:http :port] web-port)))
+    (configure-archive-state! runtime-config)
     
     (let [telemetry-srv (telemetry/start-telemetry-server {:port telemetry-port})
-          web-srv (start-web-server {:port web-port
+          web-srv (start-web-server {:host web-host
+                                     :port web-port
                                      :telemetry-stream (:fan-out telemetry-srv)})]
       
       ;; Add shutdown hook

@@ -37,7 +37,41 @@ The system consists of three main components:
      - **Packets**: Historical view of recent telemetry packets
    - Controls: Pause, Clear, View Toggle
 
-## Commands
+## Install And Deployment
+
+Supported install paths:
+
+- Developer workflow: [docs/development.md](docs/development.md)
+- Source or jar install: [docs/install.md](docs/install.md)
+- Runtime config: [docs/config.md](docs/config.md)
+- systemd deploy: [docs/deploy-systemd.md](docs/deploy-systemd.md)
+- Printer setup: [docs/printer-setup.md](docs/printer-setup.md)
+- Releases and tagging: [docs/releases.md](docs/releases.md)
+- Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
+
+Quick developer start:
+
+```bash
+npm ci
+bin/dev-service start
+```
+
+Quick production-from-source start:
+
+```bash
+cp config/prusa-telemetry.edn.example config/prusa-telemetry.edn
+npm ci
+clojure -M:shadow-cljs compile app
+clojure -M:shadow-cljs compile replay-worker
+clojure -M:prod:run-web
+```
+
+Quick release build:
+
+```bash
+npm ci
+clojure -T:build release
+```
 
 ### Toolchain with mise
 
@@ -64,11 +98,12 @@ Compile the ClojureScript frontend to JavaScript:
 
 ```bash
 clojure -M:shadow-cljs compile app
+clojure -M:shadow-cljs compile replay-worker
 ```
 
 This generates:
-- `resources/app.js` - Main application loader
-- `target/cljs-out/` - Compiled JavaScript modules
+- `resources/js/` - Main application modules
+- `resources/js/replay-worker/` - Replay worker modules
 
 **Note**: You must rebuild ClojureScript after making changes to `src-cljs/` files.
 
@@ -77,13 +112,13 @@ This generates:
 Start both the telemetry server and web server:
 
 ```bash
-clj -M:run-web
+clojure -M:prod:run-web
 ```
 
 Or with custom ports (telemetry port, web port):
 
 ```bash
-clj -M:run-web 8514 8080
+clojure -M:prod:run-web 8514 8080
 ```
 
 Default ports:
@@ -178,13 +213,13 @@ published `flow-storm-dbg` runtime hook arity.
 Run just the telemetry server (for debugging or console output):
 
 ```bash
-clj -M:run-m
+clojure -M:run-m
 ```
 
 Or with custom port:
 
 ```bash
-clj -M:run-m 8514
+clojure -M:run-m 8514
 ```
 
 ### Run Tests
@@ -193,20 +228,19 @@ clj -M:run-m 8514
 clojure -M:test
 ```
 
-### Build Uberjar
+### Build Release Jar
 
 Create a standalone JAR file:
 
 ```bash
-clojure -M:shadow-cljs compile app
-clojure -T:build ci
+clojure -T:build release
 ```
 
 This creates `target/prusa_telemetry-0.1.0-SNAPSHOT.jar`
 with `aeonik.web-server` as the entrypoint, so it starts both the UDP
 telemetry listener and HTTP dashboard/archive server.
 
-Run the uberjar:
+Run the jar:
 
 ```bash
 java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar [telemetry-port] [web-port]
@@ -216,20 +250,27 @@ java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar [telemetry-port] [web-port]
 
 ### Quick Start
 
-1. **Build the frontend**:
+1. **Copy config**:
    ```bash
+   cp config/prusa-telemetry.edn.example config/prusa-telemetry.edn
+   ```
+
+2. **Install JS dependencies and build the frontend**:
+   ```bash
+   npm ci
    clojure -M:shadow-cljs compile app
+   clojure -M:shadow-cljs compile replay-worker
    ```
 
-2. **Start the server**:
+3. **Start the server**:
    ```bash
-   clj -M:run-web
+   clojure -M:prod:run-web
    ```
 
-3. **Open your browser**:
+4. **Open your browser**:
    Navigate to `http://localhost:8080`
 
-4. **Configure your Prusa printer** to send telemetry to your machine's IP on port 8514
+5. **Configure your Prusa printer** to send telemetry to your machine's IP on port 8514
 
 ### Dashboard Features
 
@@ -257,16 +298,19 @@ Telemetry packets are automatically saved to disk:
 
 ### PrusaLink API Auth
 
-PrusaLink credentials are read from `config/prusalink.edn`, which is ignored by git.
-Copy `config/prusalink.edn.example` and replace the placeholders:
+PrusaLink credentials are preferably read from `config/prusa-telemetry.edn`,
+which is ignored by git. Copy `config/prusa-telemetry.edn.example` and replace
+the placeholders:
 
 ```clojure
-{:base-url "http://printer.local"
- :username "your-username"
- :password "your-password"}
+{:prusalink
+ {:base-url "http://printer.local"
+  :username "your-username"
+  :password "your-password"}}
 ```
 
-You can override the location with `PRUSALINK_AUTH_FILE=/path/to/prusalink.edn`.
+Legacy `config/prusalink.edn` and `PRUSALINK_AUTH_FILE=/path/to/prusalink.edn`
+are still supported.
 The service exposes `/api/prusalink/auth` to confirm whether the auth file is present and valid without returning the password.
 It also proxies the printer API through backend Digest auth:
 
@@ -304,11 +348,12 @@ prusa_telemetry/
 ├── src-cljs/               # ClojureScript source
 │   └── aeonik/
 │       └── app.cljs       # Frontend application
-├── resources/              # Static assets
+├── resources/              # Static assets and generated CLJS modules
 │   ├── index.html         # Main HTML page
-│   └── app.js             # Generated ClojureScript loader
+│   └── js/                # Generated ClojureScript modules
+├── docs/                   # Install, config, deploy, release docs
+├── install/                # systemd and install templates
 ├── target/                 # Build artifacts
-│   └── cljs-out/          # Compiled JavaScript
 ├── shadow-cljs.edn        # ClojureScript build/dev server config
 └── deps.edn               # Dependencies
 ```
@@ -322,26 +367,30 @@ prusa_telemetry/
 
 ### Making Changes
 
-1. **Backend changes** (`src/`): Just restart the server
-2. **Frontend changes** (`src-cljs/`): Rebuild with `clojure -M:shadow-cljs compile app` then refresh browser
-3. **HTML/CSS changes** (`resources/index.html`): Just refresh browser
+1. **Backend changes** (`src/`): prefer `(user/reload!)` from the backend REPL.
+2. **Frontend app changes** (`src-cljs/`): Shadow watches the `app` build during `bin/dev-service start`.
+3. **Replay worker changes**: run `clojure -M:shadow-cljs compile replay-worker` and reload the page.
+4. **HTML/CSS changes** (`resources/index.html`): refresh the browser.
 
 ### Debugging
 
 - Check browser console (F12) for frontend errors
 - Server logs show WebSocket connections and data flow
-- Use `clj -M:run-m` to see raw telemetry data in console
+- Use `clojure -M:run-m` to see raw telemetry data in console
 
 ## Configuration
 
 ### Ports
 
-Default ports can be changed via command-line arguments:
+Default ports can be changed through `config/prusa-telemetry.edn`,
+environment variables, or command-line arguments:
 
 ```bash
 # Custom telemetry and web ports
-clj -M:run-web 9000 3000
+clojure -M:prod:run-web 9000 3000
 ```
+
+See [docs/config.md](docs/config.md).
 
 ### Prusa Printer Configuration
 
@@ -350,6 +399,7 @@ Configure your Prusa printer to send telemetry to:
 - **Port**: 8514 (or your custom port)
 
 Refer to your Prusa printer's documentation for telemetry configuration.
+See [docs/printer-setup.md](docs/printer-setup.md) for the app-side checklist.
 
 ## License
 

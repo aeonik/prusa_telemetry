@@ -1,0 +1,18 @@
+;; Copy this file to config/prusa-telemetry.edn or set PRUSA_CONFIG to another path.
+;; Secrets in config/prusa-telemetry.edn are intentionally ignored by git.
+
+{:telemetry
+ {:port 8514}
+
+ :http
+ {:host "0.0.0.0"
+  :port 8080}
+
+ :archive
+ {:prints-dir "telemetry-data/prints"
+  :print-end-timeout-ms 600000}
+
+ :prusalink
+ {:base-url "http://printer.local"
+  :username "put-username-here"
+  :password "put-password-here"}}

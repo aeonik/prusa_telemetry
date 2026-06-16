@@ -1,5 +1,6 @@
 (ns aeonik.prusalink-auth
   (:require
+   [aeonik.config :as config]
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]))
@@ -44,9 +45,19 @@
 
 (defn read-auth
   "Read PrusaLink auth from disk.
-   Returns nil when the file is absent. Throws ex-info when present but invalid."
+   Returns nil when auth is absent. Throws ex-info when present but invalid.
+
+   Precedence:
+   1. PRUSALINK_AUTH_FILE when explicitly set
+   2. :prusalink in PRUSA_CONFIG/config/prusa-telemetry.edn
+   3. legacy config/prusalink.edn"
   ([]
-   (read-auth (auth-file-path)))
+   (if (System/getenv "PRUSALINK_AUTH_FILE")
+     (read-auth (auth-file-path))
+     (or (some-> (config/load-config)
+                 config/configured-prusalink-auth
+                 normalize-auth)
+         (read-auth default-auth-file))))
   ([path]
    (let [file (io/file path)]
      (when (.exists file)
@@ -55,22 +66,33 @@
 (defn auth-status
   "Return a password-safe status map for the configured PrusaLink auth file."
   []
-  (let [path (auth-file-path)
+  (let [explicit-path (System/getenv "PRUSALINK_AUTH_FILE")
+        path (auth-file-path)
         file (io/file path)]
-    (if-not (.exists file)
-      {:path path
+    (if (and explicit-path (not (.exists file)))
+      {:source :auth-file
+       :path path
        :exists? false
        :configured? false}
       (try
-        (let [auth (read-auth path)]
-          {:path path
+        (if-let [auth (read-auth)]
+          {:source (cond
+                     explicit-path :auth-file
+                     (config/configured-prusalink-auth (config/load-config)) :main-config
+                     :else :legacy-auth-file)
+           :path (when explicit-path path)
            :exists? true
            :configured? true
            :base-url (:base-url auth)
            :username (:username auth)
-           :password? (not (str/blank? (:password auth)))})
+           :password? (not (str/blank? (:password auth)))}
+          {:source :none
+           :path path
+           :exists? (.exists file)
+           :configured? false})
         (catch Exception e
-          {:path path
-           :exists? true
+          {:source :error
+           :path path
+           :exists? (.exists file)
            :configured? false
            :error (.getMessage e)})))))

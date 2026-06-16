@@ -1,0 +1,21 @@
+[Unit]
+Description=Prusa Telemetry Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prusa-telemetry
+Group=prusa-telemetry
+WorkingDirectory=/opt/prusa-telemetry
+Environment=PRUSA_CONFIG=/etc/prusa-telemetry/prusa-telemetry.edn
+Environment=JAVA_OPTS=-Xms256m -Xmx2g
+ExecStart=/opt/prusa-telemetry/bin/prusa-telemetry
+Restart=on-failure
+RestartSec=5
+
+# The app writes telemetry archives below the configured :archive/:prints-dir.
+ReadWritePaths=/opt/prusa-telemetry /var/lib/prusa-telemetry
+
+[Install]
+WantedBy=multi-user.target

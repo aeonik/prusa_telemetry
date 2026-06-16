@@ -1,5 +1,6 @@
 (ns aeonik.prusalink-auth-test
   (:require
+   [aeonik.config :as config]
    [aeonik.prusalink-auth :as auth]
    [clojure.test :refer :all]))
 
@@ -20,3 +21,14 @@
        #"Invalid PrusaLink auth config"
        (auth/normalize-auth {:base-url "http://printer.local"
                              :username "maker"}))))
+
+(deftest reads-auth-from-main-config
+  (with-redefs [config/load-config
+                (fn []
+                  {:prusalink {:base-url "http://printer.local/"
+                               :username " maker "
+                               :password " secret "}})]
+    (is (= {:base-url "http://printer.local"
+            :username "maker"
+            :password "secret"}
+           (auth/read-auth)))))

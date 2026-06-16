@@ -36,6 +36,9 @@
                        "--enable-native-access=ALL-UNNAMED"
                        "--enable-preview"
                        "-Dio.netty.tryReflectionSetAccessible=true"]}
+  :prod     {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                       "--enable-native-access=ALL-UNNAMED"
+                       "-Dio.netty.tryReflectionSetAccessible=true"]}
   :run-m    {:main-opts ["-m" "aeonik.prusa-telemetry"]}
   :run-web  {:main-opts ["-m" "aeonik.web-server"]}
   :dev-service {:extra-deps {nrepl/nrepl {:mvn/version "1.3.1"}}
