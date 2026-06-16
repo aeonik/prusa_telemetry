@@ -51,7 +51,9 @@
 
 (defn- sample-count
   [series]
-  (alength (:packet-msgs series)))
+  (if-let [packet-msgs (:packet-msgs series)]
+    (alength packet-msgs)
+    0))
 
 (defn- sample-at-index
   [series idx]
@@ -259,6 +261,22 @@
    :metric-samples (:event-count index)
    :packet-metadata (count (:packets index))})
 
+(defn series-summary
+  "Return the display-safe metadata for one replay metric series.
+   Sample columns are intentionally omitted so worker-backed replay state stays small."
+  [series]
+  (select-keys (finalize-series series)
+               [:key
+                :sender
+                :name
+                :type
+                :print-filename
+                :numeric?
+                :sample-count
+                :event-count
+                :stats
+                :latest]))
+
 (defn finalize
   "Finalize an incremental replay index build for app-state."
   [build]
@@ -279,6 +297,15 @@
                :packet-index (:packet-index build)
                :metric-cards cards}]
     (assoc index :memory-summary (memory-summary index))))
+
+(defn summarize
+  "Return a compact replay index summary suitable for app-state.
+   The full metric sample columns remain in the worker-owned index."
+  [index]
+  (-> index
+      (assoc :worker-backed? true)
+      (assoc :metric-cards (mapv series-summary (:metric-cards index)))
+      (dissoc :packets :packet-index)))
 
 (defn packet-at
   "Return packet metadata for packet-msg."
@@ -370,3 +397,23 @@
                      (str (:name event))
                      (or (:device-time-us event) 0)]))
          vec)))
+
+(defn snapshot-at
+  "Return the packet-local replay data needed to render one scrub position."
+  ([index packet-msg]
+   (snapshot-at index packet-msg 120))
+  ([index packet-msg window-size]
+   (let [window-size (or window-size 120)]
+     {:packet-msg packet-msg
+      :packet (packet-at index packet-msg)
+      :metrics-at-packet (events-at-packet index packet-msg)
+      :cards (mapv (fn [series]
+                     (let [sample (sample-at-or-before series packet-msg)
+                           event (sample->event series sample)]
+                       (cond-> {:key (:key series)
+                                :selected-sample sample
+                                :selected-event event}
+                         (:numeric? series)
+                         (assoc :numeric-values
+                                (numeric-window-values-at series packet-msg window-size)))))
+                   (:metric-cards index))})))

@@ -24,9 +24,11 @@
     :selected-filename  nil     ; Selected file identifier (format: "date:filename")
     :timeline-playing   false    ; Timeline auto-play state
     :replay             {:selected-run nil
+                         :token nil
                          :loading? false
                          :load-progress nil
                          :data nil
+                         :snapshot nil
                          :error nil
                          :gcode nil
                          :gcode-file-name nil

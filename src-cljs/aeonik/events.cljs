@@ -163,9 +163,11 @@
                  (assoc :selected-filename nil)
                  (assoc :timeline-playing false)
                  (assoc-in [:replay :selected-run] archive)
+                 (assoc-in [:replay :token] token)
                  (assoc-in [:replay :loading?] true)
                  (assoc-in [:replay :load-progress] {:processed 0 :total (count packets)})
                  (assoc-in [:replay :data] nil)
+                 (assoc-in [:replay :snapshot] nil)
                  (assoc-in [:replay :error] nil))))
     (js/setTimeout #(process-replay-batches! (replay-index/empty-build archive (count packets))
                                              batches
@@ -186,12 +188,14 @@
           (assoc :selected-filename nil)
           (assoc :timeline-playing false)
           (assoc-in [:replay :selected-run] archive)
+          (assoc-in [:replay :token] token)
           (assoc-in [:replay :loading?] true)
           (assoc-in [:replay :load-progress] {:processed 0
                                                :total total
                                                :bytes-loaded 0
                                                :bytes-total bytes-total})
           (assoc-in [:replay :data] nil)
+          (assoc-in [:replay :snapshot] nil)
           (assoc-in [:replay :error] nil)))
     state))
 
@@ -199,10 +203,15 @@
   [token]
   (= token (:token @batch-processing-state)))
 
+(defn- replay-state-token-active?
+  [state token]
+  (or (nil? token)
+      (= token (get-in state [:replay :token]))))
+
 (defn- progress-from-build
-  [build {:keys [bytes-loaded bytes-total]}]
-  (cond-> {:processed (:packet-count build)
-           :total (:total build)}
+  [build {:keys [processed total bytes-loaded bytes-total]}]
+  (cond-> {:processed (or processed (:packet-count build))
+           :total (or total (:total build))}
     bytes-loaded
     (assoc :bytes-loaded bytes-loaded)
 
@@ -223,7 +232,9 @@
   (if (replay-stream-token-active? token)
     (let [build (:build @batch-processing-state)]
       (assoc-in state [:replay :load-progress] (progress-from-build build ev)))
-    state))
+    (if (replay-state-token-active? state token)
+      (assoc-in state [:replay :load-progress] (progress-from-build nil ev))
+      state)))
 
 (defn- complete-replay-stream-load
   [state {:keys [token]}]
@@ -238,7 +249,30 @@
           (assoc-in [:replay :loading?] false)
           (assoc-in [:replay :load-progress] nil)
           (assoc-in [:replay :data] data)
+          (assoc-in [:replay :snapshot] nil)
           (assoc-in [:replay :error] nil)))
+    state))
+
+(defn- complete-replay-index-load
+  [state {:keys [token data snapshot]}]
+  (if (replay-state-token-active? state token)
+    (let [start-msg (get-in data [:packet-range :min])]
+      (reset! batch-processing-state nil)
+      (-> state
+          (assoc :selected-packet-msg start-msg)
+          (assoc :selected-filename (:print-filename data))
+          (assoc :timeline-playing false)
+          (assoc-in [:replay :loading?] false)
+          (assoc-in [:replay :load-progress] nil)
+          (assoc-in [:replay :data] data)
+          (assoc-in [:replay :snapshot] snapshot)
+          (assoc-in [:replay :error] nil)))
+    state))
+
+(defn- apply-replay-snapshot
+  [state {:keys [token snapshot]}]
+  (if (replay-state-token-active? state token)
+    (assoc-in state [:replay :snapshot] snapshot)
     state))
 
 (defn- handle-ws-message
@@ -460,6 +494,7 @@
           (assoc :selected-filename nil)
           (assoc :timeline-playing false)
           (assoc-in [:replay :selected-run] (:archive ev))
+          (assoc-in [:replay :token] (:token ev))
           (assoc-in [:replay :loading?] true)
           (assoc-in [:replay :load-progress]
                     (cond-> {:processed 0
@@ -468,6 +503,7 @@
                       (:bytes-total ev)
                       (assoc :bytes-total (:bytes-total ev))))
           (assoc-in [:replay :data] nil)
+          (assoc-in [:replay :snapshot] nil)
           (assoc-in [:replay :error] nil)))
 
     :replay/load-error
@@ -492,6 +528,12 @@
 
     :replay/stream-complete
     (complete-replay-stream-load state ev)
+
+    :replay/index-ready
+    (complete-replay-index-load state ev)
+
+    :replay/snapshot-ready
+    (apply-replay-snapshot state ev)
 
     :replay/select-run
     (assoc-in state [:replay :selected-run] (:archive ev))

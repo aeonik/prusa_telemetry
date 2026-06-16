@@ -724,11 +724,20 @@
   (when-let [summary (metric-by-names metric-cards names)]
     (replay-index/event-at-or-before summary packet-msg)))
 
-(defn- replay-correlation [gcode-data replay-data packet-range current-packet-msg]
+(defn- snapshot-metric-by-names [snapshot names]
+  (some (fn [card]
+          (let [event (:selected-event card)]
+            (when (metric-name-matches? event names)
+              event)))
+        (:cards snapshot)))
+
+(defn- replay-correlation [gcode-data replay-data snapshot packet-range current-packet-msg]
   (let [segments (:segments gcode-data)
-        sdpos-metric (metric-at-or-before (:metric-cards replay-data)
-                                          sdpos-metric-names
-                                          current-packet-msg)
+        sdpos-metric (if (:worker-backed? replay-data)
+                       (snapshot-metric-by-names snapshot sdpos-metric-names)
+                       (metric-at-or-before (:metric-cards replay-data)
+                                            sdpos-metric-names
+                                            current-packet-msg))
         sdpos (te/metric-number sdpos-metric)
         packet-ratio (packet-ratio packet-range current-packet-msg)
         sdpos-ratio (when (and (number? sdpos)
@@ -749,13 +758,27 @@
     (when (te/finite-number? value)
       value)))
 
-(defn- replay-metric-card [summary current-packet-msg]
+(defn- replay-metric-card [summary current-packet-msg snapshot-card]
   (let [latest (:latest summary)
-        selected-sample (replay-index/sample-at-or-before summary current-packet-msg)
-        numeric-values (replay-index/numeric-window-values-at
-                        summary
-                        current-packet-msg
-                        replay-spark-window)
+        sample-backed? (some? (:packet-msgs summary))
+        selected-sample (or (:selected-sample snapshot-card)
+                            (when sample-backed?
+                              (replay-index/sample-at-or-before summary current-packet-msg)))
+        selected-event (or (:selected-event snapshot-card)
+                           (when sample-backed?
+                             (replay-index/sample->event summary selected-sample)))
+        numeric-values (cond
+                         snapshot-card
+                         (or (:numeric-values snapshot-card) [])
+
+                         sample-backed?
+                         (replay-index/numeric-window-values-at
+                          summary
+                          current-packet-msg
+                          replay-spark-window)
+
+                         :else
+                         [])
         numeric? (:numeric? summary)
         stats (metric-stats numeric-values)
         selected-value (cond
@@ -763,8 +786,7 @@
                          (format-dashboard-number (sample-number selected-sample))
 
                          selected-sample
-                         (u/format-metric-value
-                          (replay-index/sample->event summary selected-sample))
+                         (u/format-metric-value selected-event)
 
                          :else "--")
         sender (:sender latest)
@@ -792,11 +814,21 @@
                               (str (:packet-msg selected-sample))
                               "--")]])]]))
 
-(defn- replay-toolpath-panel [gcode-data replay-data packet-range current-packet-msg]
+(defn- replay-toolpath-panel [gcode-data replay-data snapshot packet-range current-packet-msg]
   [gcode-view/replay-toolpath-panel
    gcode-data
    (when gcode-data
-     (replay-correlation gcode-data replay-data packet-range current-packet-msg))])
+     (replay-correlation gcode-data replay-data snapshot packet-range current-packet-msg))])
+
+(defn- snapshot-current?
+  [snapshot packet-msg]
+  (and snapshot
+       packet-msg
+       (= (:packet-msg snapshot) packet-msg)))
+
+(defn- snapshot-card-map
+  [snapshot]
+  (into {} (map (fn [card] [(:key card) card]) (:cards snapshot))))
 
 (defonce replay-autoload-run (atom nil))
 
@@ -840,6 +872,7 @@
         replay (:replay app-state)
         selected-run (:selected-run replay)
         replay-data (:data replay)
+        replay-snapshot (:snapshot replay)
         print-filename (:print-filename replay-data)
         packet-range (:packet-range replay-data)
         current-packet-msg (current-packet-msg-for (:selected-packet-msg app-state) packet-range)
@@ -859,8 +892,19 @@
         _ (when (and packet-range current-packet-msg
                      (not= current-packet-msg (:selected-packet-msg app-state)))
             (js/setTimeout #(dispatch! {:type :timeline/set-packet-msg :packet-msg current-packet-msg}) 0))
-        packet (replay-packet-at replay-data current-packet-msg)
-        metrics-at-packet (replay-index/events-at-packet replay-data current-packet-msg)
+        active-snapshot (when (snapshot-current? replay-snapshot current-packet-msg)
+                          replay-snapshot)
+        _ (when (and (:worker-backed? replay-data)
+                     current-packet-msg
+                     (not (snapshot-current? replay-snapshot current-packet-msg)))
+            (files/request-replay-snapshot! current-packet-msg replay-spark-window))
+        snapshot-cards (snapshot-card-map active-snapshot)
+        packet (if (:worker-backed? replay-data)
+                 (:packet active-snapshot)
+                 (replay-packet-at replay-data current-packet-msg))
+        metrics-at-packet (if (:worker-backed? replay-data)
+                            (:metrics-at-packet active-snapshot)
+                            (replay-index/events-at-packet replay-data current-packet-msg))
         sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (te/metric-display-name m))) metrics-at-packet)
         cards (->> (:metric-cards replay-data)
                    (filter #(dashboard-visible-metric? (:latest %)))
@@ -876,7 +920,7 @@
       [:div {:class "replay-scrubber-wrap"}
        (timeline-scrubber packet-range current-packet-msg (:timeline-playing app-state))]]
      [:section {:class "replay-grid"}
-      [replay-toolpath-panel (:gcode replay) replay-data packet-range current-packet-msg]
+      [replay-toolpath-panel (:gcode replay) replay-data active-snapshot packet-range current-packet-msg]
       [:div {:class "replay-scroll-column"}
        [:section {:class "replay-metrics-panel"}
         [:div {:class "replay-panel-head"}
@@ -895,7 +939,7 @@
            (map (fn [summary]
                   (let [key (:key summary)]
                     ^{:key (str/join "/" (map str key))}
-                    [replay-metric-card summary current-packet-msg]))
+                    [replay-metric-card summary current-packet-msg (get snapshot-cards key)]))
                 cards)])]
        [:section {:class "replay-current-panel"}
         [:div {:class "replay-panel-head"}
