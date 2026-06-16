@@ -1,138 +1,7 @@
 (ns aeonik.events
   (:require [aeonik.state :refer [app-state] :as state]
-            [aeonik.timeline :as timeline]
-            [aeonik.util :as u]
-            [clojure.string :as str]))
-
-;; ============================================================================
-;; WebSocket message handlers
-;; ============================================================================
-
-(defn- metric-type-name [metric-type]
-  (cond
-    (keyword? metric-type) (name metric-type)
-    (nil? metric-type) nil
-    :else (str metric-type)))
-
-(defn- metric-key [metric]
-  [(or (:sender metric) "") (or (:name metric) "")])
-
-(defn- metric-number [metric]
-  (let [value (:value metric)]
-    (when (and (number? value)
-               (not (js/isNaN value))
-               (js/isFinite value))
-      value)))
-
-(defn- parse-numeric-like [value]
-  (cond
-    (number? value) value
-    (string? value) (let [s (str/trim value)]
-                      (when (re-matches #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?" s)
-                        (let [n (js/parseFloat s)]
-                          (when-not (js/isNaN n)
-                            n))))
-    :else nil))
-
-(defn- field-entries [fields]
-  (cond
-    (map? fields) fields
-    (and (object? fields) (not (array? fields))) (js->clj fields :keywordize-keys false)
-    :else nil))
-
-(defn- metric-event
-  [sender wall-time-str wall-time-ms print-filename packet-msg received-at metric]
-  {:sender          sender
-   :name            (:name metric)
-   :value           (:value metric)
-   :fields          (:fields metric)
-   :error           (:error metric)
-   :type            (metric-type-name (:type metric))
-   :offset-us       (:offset-us metric)
-   :offset-ms       (:offset-ms metric)
-   :device-time-us  (:device-time-us metric)
-   :device-time-str (:device-time-str metric)
-   :wall-time-str   wall-time-str
-   :wall-time-ms    wall-time-ms
-   :packet-msg      packet-msg
-   :received-at     received-at
-   :print-filename  print-filename})
-
-(defn- structured-field-events [base-event]
-  (let [entries (field-entries (:fields base-event))]
-    (->> entries
-         (keep (fn [[field-name field-value]]
-                 (when-let [numeric-value (parse-numeric-like field-value)]
-                   (let [field-name-str (if (keyword? field-name)
-                                          (name field-name)
-                                          (str field-name))]
-                     (-> base-event
-                         (assoc :name (str (:name base-event) "." field-name-str)
-                                :value numeric-value
-                                :fields nil
-                                :type "numeric"
-                                :parent-name (:name base-event)
-                                :field-name field-name-str
-                                :synthetic-field? true)
-                         (dissoc :error))))))
-         vec)))
-
-(defn- expand-metric-event [base-event]
-  (let [field-events (when (= (:type base-event) "structured")
-                       (structured-field-events base-event))]
-    (if (seq field-events)
-      (into [(assoc base-event :has-numeric-fields? true)] field-events)
-      [base-event])))
-
-(defn- create-events
-  "Create event records from metrics, one per metric.
-   Returns a vector, never lazy sequences.
-   Device-time-us comes from the metrics themselves (calculated from prelude tm + offset-us).
-   Packet metadata (msg, received-at) is included for timeline navigation."
-  [sender metrics wall-time-str print-filename packet-msg received-at]
-  (let [wall-time-ms (or (u/parse-wall-time-str wall-time-str)
-                         (when wall-time-str
-                           (println "Warning: Failed to parse wall-time-str:" wall-time-str)
-                           nil))]
-    (vec (mapcat (fn [m]
-                   (expand-metric-event
-                    (metric-event sender wall-time-str wall-time-ms print-filename packet-msg received-at m)))
-                 metrics))))
-
-(defn- time-range
-  "Calculate time range from events using device-time-us (microseconds)"
-  [events]
-  (when (seq events)
-    (let [events-with-time (filter #(some? (:device-time-us %)) events)]
-      (when (seq events-with-time)
-        (let [times (map :device-time-us events-with-time)
-              min-t (apply min times)
-              max-t (apply max times)]
-          {:min min-t :max max-t})))))
-
-(defn- strip-quotes
-  "Remove leading/trailing quotes from a string"
-  [s]
-  (when s
-    (-> (str s)
-        (str/replace #"^[\"']+" "")
-        (str/replace #"[\"']+$" "")
-        str/trim)))
-
-(defn- normalize-filename-for-matching
-  "Try to match filename to one in timeline-filenames, handling format differences"
-  [filename timeline-filenames]
-  (let [normalize (fn [f]
-                   (-> f
-                       strip-quotes
-                       (str/replace #"^_" "")
-                       (str/replace #"\.edn$" "")))
-        normalized-input (normalize filename)
-        find-match (fn [timeline-fname]
-                    (= normalized-input (normalize timeline-fname)))]
-    (or (some #(when (= filename %) %) timeline-filenames)
-        (some #(when (find-match %) %) timeline-filenames)
-        filename)))
+            [aeonik.telemetry-events :as te]
+            [aeonik.timeline :as timeline]))
 
 (defn- ensure-timeline-selection
   [state print-filename]
@@ -144,9 +13,9 @@
       (let [selected-filename-from-state (:selected-filename state)
             ;; Normalize the selected filename to match timeline-data keys
             current-filename (or (when selected-filename-from-state
-                                  (normalize-filename-for-matching selected-filename-from-state filenames))
+                                  (te/normalize-filename-for-matching selected-filename-from-state filenames))
                                 (when print-filename
-                                  (normalize-filename-for-matching print-filename filenames))
+                                  (te/normalize-filename-for-matching print-filename filenames))
                                 (first filenames))
             packets (get timeline-data current-filename [])]
         (when (not= selected-filename-from-state current-filename)
@@ -172,92 +41,6 @@
               (assoc :selected-packet-msg max-msg)))
           state)))))
 
-(defn- extract-print-filename-from-metrics
-  "Extract print_filename from a list of metrics, stripping quotes and normalizing"
-  [metrics]
-  (let [print-filename-metric (first (filter #(= (:name %) "print_filename") metrics))
-        raw-value (when print-filename-metric
-                   (or (:value print-filename-metric)
-                       (when-let [fields (:fields print-filename-metric)]
-                         (if (map? fields)
-                           (or (get fields "value")
-                               (get fields :value)
-                               (first (vals fields)))
-                           nil))))
-        ;; Strip quotes and normalize
-        cleaned (when raw-value
-                 (-> (str raw-value)
-                     (str/replace #"^[\"']" "")
-                     (str/replace #"[\"']$" "")
-                     str/trim))]
-    cleaned))
-
-(defn- get-event-time
-  "Get device-time-us from event, defaulting to 0"
-  [e]
-  (or (:device-time-us e) 0))
-
-(defn- merge-sorted-events
-  "Efficiently merge two sorted event vectors into one sorted vector.
-   Both vectors should already be sorted by device-time-us.
-   This is O(n+m) instead of O(n*log(n+m)) for sort.
-   Returns a vector, never lazy sequences."
-  [existing-events new-events]
-  (cond
-    (empty? new-events) existing-events
-    (empty? existing-events) (if (vector? new-events) new-events (vec new-events))
-    :else
-    (let [existing-vec (if (vector? existing-events) existing-events (vec existing-events))
-          new-vec (if (vector? new-events) new-events (vec new-events))
-          existing-time (get-event-time (last existing-vec))
-          new-time (get-event-time (first new-vec))]
-      (if (>= new-time existing-time)
-        ;; Fast path: new events are all after existing events
-        (into existing-vec new-vec)
-        ;; Need to merge: both lists have events, merge them eagerly
-        (loop [result (transient [])
-               existing-idx 0
-               new-idx 0
-               existing-len (count existing-vec)
-               new-len (count new-vec)]
-          (cond
-            (>= existing-idx existing-len)
-            (persistent! (reduce conj! result (subvec new-vec new-idx)))
-            (>= new-idx new-len)
-            (persistent! (reduce conj! result (subvec existing-vec existing-idx)))
-            :else
-            (let [e-time (get-event-time (get existing-vec existing-idx))
-                  n-time (get-event-time (get new-vec new-idx))]
-              (if (<= e-time n-time)
-                (recur (conj! result (get existing-vec existing-idx))
-                       (inc existing-idx) new-idx existing-len new-len)
-                (recur (conj! result (get new-vec new-idx))
-                       existing-idx (inc new-idx) existing-len new-len)))))))))
-(defn- packets-to-events
-  "Convert telemetry packets to event records, sorted by device-time-us.
-   Returns a vector, never lazy sequences.
-   Packets from files are already sorted, but we still need to sort events within packets."
-  [packets]
-  (let [events-vec (reduce (fn [acc packet]
-                              (let [sender (:sender packet)
-                                    metrics (:metrics packet)
-                                    wall-time-str (:wall-time-str packet)
-                                    prelude (:prelude packet)
-                                    packet-msg (:msg prelude)
-                                    received-at (:received-at packet)
-                                    print-filename (extract-print-filename-from-metrics metrics)
-                                    new-events (create-events sender metrics wall-time-str print-filename packet-msg received-at)]
-                                ;; Log if we have events without device-time-us
-                                (when (and (seq new-events) (nil? (:device-time-us (first new-events))))
-                                  (println "Warning: Packet has no device-time-us. wall-time-str:" wall-time-str
-                                           "sender:" sender "metrics count:" (count metrics)))
-                                ;; Use reduce with conj! for transient vectors, not into
-                                (reduce conj! acc new-events)))
-                            (transient [])
-                            packets)]
-    ;; Sort events from this packet batch (already a vector, sort returns vector)
-    (vec (sort-by get-event-time (persistent! events-vec)))))
-
 (def ^:private batch-size 100) ; Process packets in batches to avoid blocking UI
 (def ^:private live-event-limit 12000)
 (def ^:private replay-batch-size 250)
@@ -265,16 +48,6 @@
 
 ;; Atom to track batch processing state
 (defonce batch-processing-state (atom nil))
-
-(defn- trim-live-events
-  "Keep the browser dashboard responsive by retaining only recent live events.
-   Full print archives are still saved on disk by the backend."
-  [events]
-  (let [events (if (vector? events) events (vec events))
-        event-count (count events)]
-    (if (> event-count live-event-limit)
-      (subvec events (- event-count live-event-limit))
-      events)))
 
 (defn- load-telemetry-packets-batch
   "Load a batch of telemetry packets into state.
@@ -286,8 +59,8 @@
       {:telemetry-events [] :available-files [] :view-mode :latest})
     (if (or (nil? packets-batch) (not (sequential? packets-batch)) (empty? packets-batch))
       state
-      (let [new-events (packets-to-events packets-batch)
-            updated-events (merge-sorted-events (:telemetry-events state) new-events)]
+      (let [new-events (te/packets-to-events packets-batch)
+            updated-events (te/merge-sorted-events (:telemetry-events state) new-events)]
         (assoc state :telemetry-events updated-events)))))
 
 (defn- process-next-batch
@@ -355,9 +128,9 @@
       samples)))
 
 (defn- update-replay-summary [summary event]
-  (let [value (metric-number event)
+  (let [value (te/metric-number event)
         summary (-> (or summary {})
-                    (assoc :key (metric-key event)
+                    (assoc :key (te/metric-key event)
                            :sender (:sender event)
                            :name (:name event)
                            :type (:type event)
@@ -400,19 +173,19 @@
         prelude (:prelude packet)
         packet-msg (or (:msg prelude) (:packet-count build))
         received-at (:received-at packet)
-        print-filename (or (extract-print-filename-from-metrics metrics)
+        print-filename (or (te/extract-print-filename-from-metrics metrics)
                            (:print-filename build))]
     {:packet-msg packet-msg
      :received-at received-at
      :wall-time-str wall-time-str
      :print-filename print-filename
-     :events (create-events sender metrics wall-time-str print-filename packet-msg received-at)}))
+     :events (te/create-events sender metrics wall-time-str print-filename packet-msg received-at)}))
 
 (defn- add-replay-packet [build packet]
   (let [{:keys [packet-msg events print-filename] :as replay-packet} (replay-packet-events build packet)
         packet-index (count (:packets build))
         summaries (reduce (fn [acc event]
-                            (let [key (metric-key event)]
+                            (let [key (te/metric-key event)]
                               (update acc key update-replay-summary event)))
                           (:summaries build)
                           events)
@@ -512,11 +285,12 @@
       state
     (let [packet-msg (:msg prelude)
           received-at-ms (when received-at (if (number? received-at) received-at (.getTime received-at)))
-          new-events-unsorted (create-events sender metrics wall-time-str print-filename packet-msg received-at-ms)
+          new-events-unsorted (te/create-events sender metrics wall-time-str print-filename packet-msg received-at-ms)
           ;; Sort new events before merging (they're from a single packet, so should be small)
-          new-events (vec (sort-by get-event-time new-events-unsorted))
-          updated-events (trim-live-events
-                          (merge-sorted-events (:telemetry-events state) new-events))
+          new-events (vec (sort-by te/event-time new-events-unsorted))
+          updated-events (te/trim-events
+                          (te/merge-sorted-events (:telemetry-events state) new-events)
+                          live-event-limit)
           updated-state (assoc state :telemetry-events updated-events)]
       (when (and (seq new-events) (nil? (:device-time-us (first new-events))))
         (println "Warning: Events created without device-time-us. wall-time-str:" wall-time-str))

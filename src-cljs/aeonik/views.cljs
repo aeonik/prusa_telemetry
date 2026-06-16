@@ -1,6 +1,7 @@
 (ns aeonik.views
   (:require [aeonik.util :as u]
             [aeonik.events :refer [dispatch!]]
+            [aeonik.telemetry-events :as te]
             [aeonik.state :as state :refer [app-state]]
             [aeonik.files :as files]
             [aeonik.gcode :as gcode]
@@ -275,25 +276,12 @@
 (def ^:private dashboard-event-window 6000)
 (def ^:private dashboard-history-limit 90)
 
-(defn- finite-number? [v]
-  (and (number? v)
-       (not (js/isNaN v))
-       (js/isFinite v)))
-
-(defn- metric-key [metric]
-  [(or (:sender metric) "") (or (:name metric) "")])
-
-(defn- metric-number [metric]
-  (let [value (:value metric)]
-    (when (finite-number? value)
-      value)))
-
 (defn- dashboard-visible-metric? [metric]
   (not (and (= (:type metric) "structured")
             (:has-numeric-fields? metric))))
 
 (defn- format-dashboard-number [value]
-  (if-not (finite-number? value)
+  (if-not (te/finite-number? value)
     "--"
     (let [abs-value (js/Math.abs value)]
       (cond
@@ -313,7 +301,7 @@
         :else (str (.toFixed (/ age-ms 60000) 1) " m")))))
 
 (defn- format-duration [seconds]
-  (if-not (finite-number? seconds)
+  (if-not (te/finite-number? seconds)
     "--"
     (let [seconds (max 0 (js/Math.round seconds))
           hours (js/Math.floor (/ seconds 3600))
@@ -325,7 +313,7 @@
         :else (str secs "s")))))
 
 (defn- format-percent [value]
-  (if-not (finite-number? value)
+  (if-not (te/finite-number? value)
     "--"
     (str (.toFixed value 1) "%")))
 
@@ -404,7 +392,7 @@
         layer-label (if layer-metric "layer" "z")
         layer-display (if layer-metric
                         (u/format-metric-value layer-metric)
-                        (if (finite-number? z-value)
+                        (if (te/finite-number? z-value)
                           (str (format-dashboard-number z-value) " mm")
                           "--"))]
     [:section {:class "print-panel"}
@@ -512,7 +500,7 @@
 
 (defn- metric-card [latest history]
   (let [values (->> history
-                    (keep metric-number)
+                    (keep te/metric-number)
                     (take-last dashboard-history-limit)
                     vec)
         stats (metric-stats values)
@@ -574,14 +562,14 @@
   (let [events (:telemetry-events app-state)
         recent-events (vec (take-last dashboard-event-window events))
         latest-values (state/get-latest-values events)
-        histories (group-by metric-key recent-events)
+        histories (group-by te/metric-key recent-events)
         packet-count (count (set (keep :packet-msg recent-events)))
         metric-count (count latest-values)
         last-event (last events)
         cards (->> (vals latest-values)
                    (filter dashboard-visible-metric?)
                    (sort-by (fn [metric]
-                              [(if (metric-number metric) 0 1)
+                              [(if (te/metric-number metric) 0 1)
                                (str/lower-case (or (:name metric) ""))
                                (str (:sender metric))])))]
 	    [:div {:class "dashboard-view"}
@@ -591,7 +579,7 @@
        [:div {:class "dashboard-empty"} "Waiting for telemetry data..."]
        [:section {:class "dashboard-grid"}
         (map (fn [metric]
-               (let [key (metric-key metric)
+               (let [key (te/metric-key metric)
                      history (get histories key [])]
                  ^{:key (str (first key) "/" (second key))}
                  [metric-card metric history]))
@@ -750,7 +738,7 @@
         sdpos-metric (metric-at-or-before (:metric-cards replay-data)
                                           sdpos-metric-names
                                           current-packet-msg)
-        sdpos (metric-number sdpos-metric)
+        sdpos (te/metric-number sdpos-metric)
         packet-ratio (packet-ratio packet-range current-packet-msg)
         sdpos-ratio (when (and (number? sdpos)
                                (pos? (or (:byte-length gcode-data) 0)))
@@ -790,11 +778,11 @@
         history-idx (last-history-index-at history current-packet-msg)
         selected (when (number? history-idx) (nth history history-idx))
         window-events (history-window-at history history-idx replay-spark-window)
-        numeric-values (keep metric-number window-events)
+        numeric-values (keep te/metric-number window-events)
         numeric? (:numeric? summary)
         stats (metric-stats numeric-values)
         selected-value (cond
-                         (and numeric? selected) (format-dashboard-number (metric-number selected))
+                         (and numeric? selected) (format-dashboard-number (te/metric-number selected))
                          selected (u/format-metric-value selected)
                          :else "--")
         sender (:sender latest)
