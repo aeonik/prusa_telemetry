@@ -35,30 +35,35 @@
   [(or sender "") (or metric-name "")])
 
 (defn- metric-sample
-  [wall-time-str wall-time-ms packet-msg received-at metric]
-  (cond-> {:value (:value metric)
-           :fields (:fields metric)
-           :error (:error metric)
-           :type (te/metric-type-name (:type metric))
-           :offset-us (:offset-us metric)
-           :offset-ms (:offset-ms metric)
-           :device-time-us (:device-time-us metric)
-           :device-time-str (:device-time-str metric)
-           :wall-time-str wall-time-str
-           :wall-time-ms wall-time-ms
-           :packet-msg packet-msg
-           :received-at received-at}
-    (:has-numeric-fields? metric)
-    (assoc :has-numeric-fields? true)))
+  [packet-msg metric]
+  (cond-> {:packet-msg packet-msg}
+    (contains? metric :value)
+    (assoc :value (:value metric))
+
+    (:fields metric)
+    (assoc :fields (:fields metric))
+
+    (:error metric)
+    (assoc :error (:error metric))
+
+    (:offset-us metric)
+    (assoc :offset-us (:offset-us metric))
+
+    (:device-time-us metric)
+    (assoc :device-time-us (:device-time-us metric))))
 
 (defn sample->event
   "Rehydrate one compact sample into the event shape expected by existing views."
   [series sample]
   (when sample
-    (assoc sample
-           :sender (:sender series)
-           :name (:name series)
-           :print-filename (:print-filename series))))
+    (cond-> (assoc sample
+                   :sender (:sender series)
+                   :name (:name series)
+                   :type (:type series)
+                   :print-filename (:print-filename series))
+      (and (:device-time-us sample)
+           (nil? (:device-time-str sample)))
+      (assoc :device-time-str (u/format-device-time-us (:device-time-us sample))))))
 
 (defn- sample-number
   [sample]
@@ -111,6 +116,9 @@
                                             metric-type
                                             print-filename
                                             sample))
+      true
+      (update :event-count (fnil inc 0))
+
       new-series?
       (update :series-order conj key))))
 
@@ -121,35 +129,34 @@
     (str field-name)))
 
 (defn- add-metric-samples
-  [build sender print-filename wall-time-str wall-time-ms packet-msg received-at metric]
+  [build sender print-filename packet-msg metric]
   (let [metric-name (:name metric)
         metric-type (te/metric-type-name (:type metric))
         fields (te/field-entries (:fields metric))
-        structured-field-samples (when (= metric-type "structured")
-                                   (keep (fn [[field-name field-value]]
-                                           (when-let [numeric-value (te/parse-numeric-like field-value)]
-                                             (let [field-name (field-name-str field-name)]
-                                               {:name (str metric-name "." field-name)
-                                                :sample (-> (metric-sample wall-time-str
-                                                                           wall-time-ms
-                                                                           packet-msg
-                                                                           received-at
-                                                                           metric)
-                                                            (assoc :value numeric-value
-                                                                   :fields nil
-                                                                   :type "numeric"
-                                                                   :parent-name metric-name
-                                                                   :field-name field-name
-                                                                   :synthetic-field? true)
-                                                            (dissoc :error))})))
-                                         fields))
-        base-metric (cond-> metric
-                      (seq structured-field-samples)
-                      (assoc :has-numeric-fields? true))
-        base-sample (metric-sample wall-time-str wall-time-ms packet-msg received-at base-metric)]
+        structured-field-samples (if (= metric-type "structured")
+                                   (->> fields
+                                        (keep (fn [[field-name field-value]]
+                                                (when-let [numeric-value (te/parse-numeric-like field-value)]
+                                                  (let [field-name (field-name-str field-name)]
+                                                    {:name (str metric-name "." field-name)
+                                                     :sample {:packet-msg packet-msg
+                                                              :value numeric-value
+                                                              :device-time-us (:device-time-us metric)
+                                                              :parent-name metric-name
+                                                              :field-name field-name
+                                                              :synthetic-field? true}}))))
+                                        vec)
+                                   [])]
     (reduce (fn [acc {:keys [name sample]}]
               (add-sample acc sender print-filename name "numeric" sample))
-            (add-sample build sender print-filename metric-name metric-type base-sample)
+            (if (seq structured-field-samples)
+              build
+              (add-sample build
+                          sender
+                          print-filename
+                          metric-name
+                          metric-type
+                          (metric-sample packet-msg metric)))
             structured-field-samples)))
 
 (defn add-packet
@@ -162,7 +169,6 @@
         received-at (:received-at packet)
         print-filename (or (te/extract-print-filename-from-metrics metrics)
                            (:print-filename build))
-        wall-time-ms (u/parse-wall-time-str wall-time-str)
         packet-meta {:packet-msg packet-msg
                      :received-at received-at
                      :wall-time-str wall-time-str
@@ -174,10 +180,7 @@
                                 (add-metric-samples acc
                                                     sender
                                                     print-filename
-                                                    wall-time-str
-                                                    wall-time-ms
                                                     packet-msg
-                                                    received-at
                                                     metric))
                               build
                               metrics)
