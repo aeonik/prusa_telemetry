@@ -8,6 +8,7 @@
    [aeonik.prusa-telemetry :as telemetry]
    [aeonik.prusalink-proxy :as prusalink-proxy]
    [aeonik.prusalink-state :as prusalink-state]
+   [aeonik.ws-bridge :as ws-bridge]
    [clojure.data.json :as json]
    [clojure.java.io :as io]
    [clojure.string :as str]))
@@ -17,66 +18,6 @@
 
 (def ^:private archive-state
   (archive/make-state {:prusalink-state prusalink-print-state}))
-
-(defn websocket-handler
-  "WebSocket handler that streams telemetry data.
-   Each WebSocket connection gets its own subscription to ensure all clients see every packet.
-   telemetry-stream: manifold stream from telemetry server (fan-out stream)"
-  [telemetry-stream]
-  (fn [req]
-    (let [ws-deferred (http/websocket-connection req)]
-      (d/chain ws-deferred
-               (fn [ws]
-
-                 ;; Create subscription stream for this client
-                 (let [client-stream (s/stream 100)]
-                   ;; Connect telemetry stream to client stream
-                   (s/connect telemetry-stream client-stream {:description "fan-out → client-stream"})
-
-                   ;; Consume packets and send to WebSocket
-                   (s/consume
-                    (fn [packet]
-                      (try
-                        (let [json-data (json/write-str (archive/telemetry-to-json packet))
-                              put-result (s/put! ws json-data)]
-                          (when put-result
-                            (d/on-realized put-result
-                                           (fn [success]
-                                             (when (and (not success) (not (s/closed? ws)))
-                                               (println "WARNING: s/put! returned false but WebSocket not closed")))
-                                           (fn [error]
-                                             (when-not (s/closed? ws)
-                                               (println "ERROR putting to WebSocket:" (.getMessage error)))))))
-                        (catch Exception e
-                          (when-not (s/closed? ws)
-                            (println "ERROR sending WebSocket message:" (.getMessage e))
-                            (.printStackTrace e)))))
-                    client-stream)
-
-                   ;; Handle client messages (if any)
-                   (s/consume
-                    (fn [msg]
-                      nil)
-                    ws)
-
-                   ;; Clean up on disconnect
-                   (s/on-closed ws
-                                (fn []
-                                  nil))
-
-                   ws)))
-      (d/catch ws-deferred
-               (fn [error]
-                 (let [error-str (str error)
-                       is-stream? (or (.contains error-str "SplicedStream")
-                                    (.contains error-str "Stream@"))]
-                   (when-not is-stream?
-                     (println "WebSocket connection error:" 
-                              (cond
-                                (instance? Exception error) (.getMessage error)
-                                (instance? Throwable error) (.getMessage error)
-                                :else (str error)))))))
-      ws-deferred)))
 
 (defn index-handler
   "Serve the main HTML page"
@@ -256,7 +197,7 @@
    "/timeline" timeline-handler
    "/dashboard" dashboard-handler
    "/replay" dashboard-handler
-   "/ws" (websocket-handler telemetry-stream)
+   "/ws" (ws-bridge/websocket-handler telemetry-stream)
    "/api/telemetry-files" list-telemetry-files-handler
    "/api/prusalink/auth" prusalink-proxy/auth-status-handler
    "/api/prusalink/print-state" (prusalink-proxy/print-state-handler prusalink-print-state)
