@@ -4,11 +4,22 @@ A real-time telemetry monitoring system for Prusa 3D printers. This application 
 
 ## Purpose
 
+This project exists to make 3D print debugging more concrete. It captures
+printer telemetry while a job is running, archives the run, and lets you replay
+the metrics against the G-code/toolpath so visible defects can be correlated
+with firmware metrics, motion position, slicer features, temperature changes,
+fan behavior, stalls, current draw, and other printer signals.
+
+It is aimed at questions like: did this surface artifact line up with a
+specific G-code region, extrusion behavior, temperature fluctuation, motor load,
+fan transition, or firmware state change?
+
 This application provides:
-- **Real-time monitoring** of Prusa printer telemetry data (temperatures, positions, status, etc.)
-- **Web-based dashboard** with live updates
-- **Multiple data views**: Latest values table or packet history
-- **Structured data support**: Displays complex metrics like runtime stats, network info, and more
+- **Real-time monitoring** of Prusa printer telemetry data while prints run
+- **Replay analysis** that correlates archived telemetry with G-code position and toolpath views
+- **Web-based dashboards** with live updates, sparklines, packet tables, and print status
+- **Structured metric support** for firmware counters, runtime stats, network info, and nested fields
+- **Append-only print archives** that preserve telemetry for later defect analysis
 
 ## Screenshots
 
@@ -55,22 +66,15 @@ The system consists of three main components:
 
 Supported install paths:
 
-- Developer workflow: [docs/development.md](docs/development.md)
 - Source or jar install: [docs/install.md](docs/install.md)
 - Runtime config: [docs/config.md](docs/config.md)
 - systemd deploy: [docs/deploy-systemd.md](docs/deploy-systemd.md)
 - Printer setup: [docs/printer-setup.md](docs/printer-setup.md)
+- Developer workflow: [docs/development.md](docs/development.md)
 - Releases and tagging: [docs/releases.md](docs/releases.md)
 - Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
-Quick developer start:
-
-```bash
-npm ci
-bin/dev-service start
-```
-
-Quick production-from-source start:
+Quick source install:
 
 ```bash
 cp config/prusa-telemetry.edn.example config/prusa-telemetry.edn
@@ -80,11 +84,18 @@ clojure -M:shadow-cljs compile replay-worker
 clojure -M:prod:run-web
 ```
 
-Quick release build:
+Quick jar build:
 
 ```bash
 npm ci
 clojure -T:build release
+```
+
+Quick developer start:
+
+```bash
+npm ci
+bin/dev-service start
 ```
 
 ### Toolchain with mise
