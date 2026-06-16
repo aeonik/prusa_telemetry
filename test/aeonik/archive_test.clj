@@ -12,6 +12,7 @@
   ([] (test-state {:available? false :active? nil}))
   ([prusalink-state]
    (archive/make-state {:active-prints (atom {})
+                        :telemetry-print-states (atom {})
                         :prusalink-state (atom prusalink-state)
                         :now-ms (constantly 1000)
                         :log-fn (fn [& _])})))
@@ -48,7 +49,8 @@
        state
        (packet "printer-1"
                [{:name "print_filename"
-                 :value "OpenSCAD Model_0.4n_0.2mm_PP_Prusa MK4S_20m44s."}]))
+                 :value "OpenSCAD Model_0.4n_0.2mm_PP_Prusa MK4S_20m44s."}
+                {:name "is_printing" :value 1}]))
       (archive/handle-packet-saving!
        state
        (packet "printer-1" [{:name "sdpos" :value 100}]))
@@ -62,6 +64,64 @@
             "OpenSCAD Model_0.4n_0.2mm_PP_Prusa MK4S_20m44s."]
            @saved))
     (is (nil? (get @(:active-prints state) "printer-1")))))
+
+(deftest packet-saving-does-not-start-from-filename-alone
+  (let [state (test-state)
+        saved (atom [])]
+    (with-redefs [archive/save-packet-to-file! (fn [_ _ filename]
+                                                 (swap! saved conj filename)
+                                                 true)]
+      (archive/handle-packet-saving!
+       state
+       (packet "printer-1"
+               [{:name "print_filename" :value "Sticky Filename.gcode"}]))
+      (archive/handle-packet-saving!
+       state
+       (packet "printer-1"
+               [{:name "print_filename" :value "Sticky Filename.gcode"}])))
+    (is (= [] @saved))
+    (is (nil? (get @(:active-prints state) "printer-1")))))
+
+(deftest packet-saving-ignores-sticky-idle-print-filename
+  (let [state (test-state)
+        saved (atom [])]
+    (with-redefs [archive/save-packet-to-file! (fn [_ _ filename]
+                                                 (swap! saved conj filename)
+                                                 true)]
+      (archive/handle-packet-saving!
+       state
+       (packet "printer-1"
+               [{:name "print_filename" :value "Finished Print.gcode"}
+                {:name "is_printing" :value 0}
+                {:name "sdpos" :value 5567332}]))
+      (archive/handle-packet-saving!
+       state
+       (packet "printer-1"
+               [{:name "print_filename" :value "Finished Print.gcode"}
+                {:name "sdpos" :value 5567332}])))
+    (is (= [] @saved))
+    (is (false? (get @(:telemetry-print-states state) "printer-1")))
+    (is (nil? (get @(:active-prints state) "printer-1")))))
+
+(deftest packet-saving-starts-when-telemetry-reports-printing
+  (let [state (test-state)
+        saved (atom [])]
+    (with-redefs [archive/save-packet-to-file! (fn [_ _ filename]
+                                                 (swap! saved conj filename)
+                                                 true)]
+      (archive/handle-packet-saving!
+       state
+       (packet "printer-1"
+               [{:name "print_filename" :value "Active Print.gcode"}
+                {:name "is_printing" :value 1}]))
+      (archive/handle-packet-saving!
+       state
+       (packet "printer-1"
+               [{:name "sdpos" :value 200}])))
+    (is (= ["Active Print.gcode"
+            "Active Print.gcode"]
+           @saved))
+    (is (true? (get @(:telemetry-print-states state) "printer-1")))))
 
 (deftest packet-saving-stops-when-prusalink-job-ends
   (let [state (test-state {:available? true :active? true})

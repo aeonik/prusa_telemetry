@@ -16,8 +16,17 @@
 (defonce ^:private prusalink-print-state
   (atom prusalink-state/initial-state))
 
+(defn- current-archive-state-shape
+  "Add newly introduced archive state slots to an existing defonce state."
+  [state]
+  (cond-> state
+    (nil? (:telemetry-print-states state))
+    (assoc :telemetry-print-states (atom {}))))
+
 (defonce ^:private archive-state
   (archive/make-state {:prusalink-state prusalink-print-state}))
+
+(alter-var-root #'archive-state current-archive-state-shape)
 
 (defonce ^:private live-handler
   (atom nil))

@@ -7,6 +7,7 @@
 (def default-prints-dir (io/file "telemetry-data" "prints"))
 (def default-print-end-timeout-ms (* 10 60 1000))
 (def missing-print-filename ::missing-print-filename)
+(def missing-telemetry-print-state ::missing-telemetry-print-state)
 
 (defn make-state
   "Create archive service state.
@@ -14,10 +15,12 @@
    The state map keeps mutable run tracking explicit at the boundary while
    leaving filename parsing, path validation, and most decisions pure."
   ([] (make-state {}))
-  ([{:keys [prints-dir active-prints prusalink-state print-end-timeout-ms
+  ([{:keys [prints-dir active-prints telemetry-print-states
+            prusalink-state print-end-timeout-ms
             now-ms log-fn]}]
    {:prints-dir (or prints-dir default-prints-dir)
     :active-prints (or active-prints (atom {}))
+    :telemetry-print-states (or telemetry-print-states (atom {}))
     :prusalink-state (or prusalink-state (atom {:available? false
                                                 :active? nil}))
     :print-end-timeout-ms (or print-end-timeout-ms default-print-end-timeout-ms)
@@ -126,6 +129,27 @@
           missing-print-filename
           metrics))
 
+(defn get-telemetry-print-state
+  "Extract the firmware print-active signal from metrics.
+
+   Returns `missing-telemetry-print-state` when the metric is absent so sticky
+   idle state can be distinguished from unknown firmware support."
+  [metrics]
+  (reduce (fn [_ metric]
+            (if (= (:name metric) "is_printing")
+              (reduced (metric-value metric))
+              missing-telemetry-print-state))
+          missing-telemetry-print-state
+          metrics))
+
+(defn print-active-value?
+  "Return true when a firmware print-active value is truthy."
+  [value]
+  (cond
+    (number? value) (pos? value)
+    (string? value) (#{"1" "true" "yes" "on"} (str/lower-case (str/trim value)))
+    :else (boolean value)))
+
 (defn active-prusalink-run-suffix
   "Return the active local print-run suffix when PrusaLink reports a live job."
   [state]
@@ -133,6 +157,11 @@
     (when (and available? active?)
       (or run-id
           (when (some? job-id) (str "job-" job-id))))))
+
+(defn prusalink-active?
+  "Return true when PrusaLink currently reports an active job."
+  [state]
+  (true? (:active? @(:prusalink-state state))))
 
 (defn print-save-filename
   "Build the archive filename for a print run.
@@ -186,6 +215,28 @@
   [state sender]
   (swap! (:active-prints state) dissoc sender))
 
+(defn refresh-telemetry-print-state!
+  "Update and return the last known telemetry print-active state for sender.
+
+   nil means this firmware has not reported `is_printing` for the sender yet."
+  [state sender raw-value]
+  (if (= missing-telemetry-print-state raw-value)
+    (get @(:telemetry-print-states state) sender)
+    (let [active? (print-active-value? raw-value)]
+      (swap! (:telemetry-print-states state) assoc sender active?)
+      active?)))
+
+(defn telemetry-print-idle?
+  "Return true when telemetry explicitly says this sender is idle."
+  [telemetry-print-active?]
+  (false? telemetry-print-active?))
+
+(defn can-start-print-save?
+  "Return true when a filename metric should start a new archive."
+  [state telemetry-print-active?]
+  (or (true? telemetry-print-active?)
+      (prusalink-active? state)))
+
 (defn prusalink-print-active?
   "Return true when PrusaLink currently reports an active job.
 
@@ -197,11 +248,11 @@
       true)))
 
 (defn clear-completed-print!
-  "Clear sticky print tracking when PrusaLink says the print is no longer active."
+  "Clear sticky print tracking when the print is no longer active."
   [state sender active-print]
   (when active-print
     ((:log-fn state)
-     "PrusaLink reports no active job; stopping telemetry save for"
+     "No active print; stopping telemetry save for"
      (or (:save-filename active-print) (:filename active-print))))
   (clear-active-print-filename! state sender))
 
@@ -252,6 +303,9 @@
         sender-str (str sender)
         current-time ((:now-ms state))
         raw-print-filename (get-print-filename metrics)
+        raw-telemetry-print-state (get-telemetry-print-state metrics)
+        telemetry-print-active? (refresh-telemetry-print-state!
+                                 state sender-str raw-telemetry-print-state)
         saw-print-filename? (not= missing-print-filename raw-print-filename)
         new-print-filename (when saw-print-filename?
                              (normalize-print-filename raw-print-filename))
@@ -265,14 +319,19 @@
       (not (prusalink-print-active? state))
       (clear-completed-print! state sender-str active-print)
 
+      (telemetry-print-idle? telemetry-print-active?)
+      (clear-completed-print! state sender-str active-print)
+
       (and saw-print-filename? (nil? new-print-filename))
       (clear-active-print-filename! state sender-str)
 
       new-print-filename
-      (let [new-save-filename (print-save-filename state new-print-filename)]
-        (when-not (= new-save-filename active-save-filename)
-          (set-active-print-filename! state sender-str new-print-filename current-time))
-        (save-packet-to-file! state (telemetry-to-json packet) new-save-filename))
+      (when (or active-save-filename
+                (can-start-print-save? state telemetry-print-active?))
+        (let [new-save-filename (print-save-filename state new-print-filename)]
+          (when-not (= new-save-filename active-save-filename)
+            (set-active-print-filename! state sender-str new-print-filename current-time))
+          (save-packet-to-file! state (telemetry-to-json packet) new-save-filename)))
 
       active-save-filename
       (save-packet-to-file! state (telemetry-to-json packet) active-save-filename))))
