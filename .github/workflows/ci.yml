@@ -19,23 +19,16 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - uses: jdx/mise-action@v2
+      - uses: DeLaGuardo/setup-clojure@13.4
         with:
-          install: true
-          cache: true
+          cli: 1.12.4.1582
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
 
-      - run: npm ci
-
       - run: clojure -M:test
-
-      - run: clojure -M:shadow-cljs compile app
-
-      - run: clojure -M:shadow-cljs compile replay-worker
 
       - run: clojure -T:build release
 
@@ -45,6 +38,8 @@ jobs:
           path: |
             target/prusa_telemetry-*.jar
             target/prusa_telemetry-*.jar.sha256
+            target/prusa-telemetry.jar
+            target/prusa-telemetry.jar.sha256
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -53,3 +48,5 @@ jobs:
           files: |
             target/prusa_telemetry-*.jar
             target/prusa_telemetry-*.jar.sha256
+            target/prusa-telemetry.jar
+            target/prusa-telemetry.jar.sha256

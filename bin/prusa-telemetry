@@ -10,18 +10,27 @@ else
   if [[ -d "$ROOT/target" ]]; then
     SEARCH_ROOTS+=("$ROOT/target")
   fi
-  JAR="$(find "${SEARCH_ROOTS[@]}" -maxdepth 1 -type f -name 'prusa_telemetry-*.jar' 2>/dev/null | sort -V | tail -n 1)"
+  JAR=""
+  for search_root in "${SEARCH_ROOTS[@]}"; do
+    if [[ -f "$search_root/prusa-telemetry.jar" ]]; then
+      JAR="$search_root/prusa-telemetry.jar"
+      break
+    fi
+  done
+  if [[ -z "$JAR" ]]; then
+    JAR="$(find "${SEARCH_ROOTS[@]}" -maxdepth 1 -type f -name 'prusa_telemetry-*.jar' 2>/dev/null | sort -V | tail -n 1)"
+  fi
 fi
 
 if [[ -z "${JAR:-}" || ! -f "$JAR" ]]; then
   cat >&2 <<EOF
-No prusa_telemetry jar found.
+No Prusa Telemetry jar found.
 
 Build one with:
   clojure -T:build release
 
 Or set:
-  PRUSA_TELEMETRY_JAR=/path/to/prusa_telemetry-VERSION.jar
+  PRUSA_TELEMETRY_JAR=/path/to/prusa-telemetry.jar
 EOF
   exit 1
 fi

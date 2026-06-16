@@ -10,6 +10,7 @@
 (def lib 'net.clojars.aeonik/prusa_telemetry)
 (def version "0.1.0-SNAPSHOT")
 (def main 'aeonik.web-server)
+(def latest-jar "target/prusa-telemetry.jar")
 
 (defn- run!
   [& command]
@@ -45,6 +46,13 @@
       (println "Wrote" out-path)
       out-path)))
 
+(defn- copy-file!
+  [from to]
+  (io/make-parents to)
+  (io/copy (io/file from) (io/file to))
+  (println "Wrote" to)
+  to)
+
 (defn test "Run the tests." [opts]
   (bb/run-tests opts))
 
@@ -56,6 +64,7 @@
 (defn cljs
   "Compile all ClojureScript release targets."
   [_opts]
+  (run! "npm" "ci" "--ignore-scripts")
   (run! "clojure" "-M:shadow-cljs" "compile" "app")
   (run! "clojure" "-M:shadow-cljs" "compile" "replay-worker"))
 
@@ -74,7 +83,9 @@
   (bb/clean opts)
   (cljs opts)
   (uber opts)
-  (sha256-file! (jar-file)))
+  (copy-file! (jar-file) latest-jar)
+  (sha256-file! (jar-file))
+  (sha256-file! latest-jar))
 
 (defn ci "Run the CI pipeline of tests (and build the uberjar)." [opts]
   (release opts))

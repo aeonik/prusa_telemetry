@@ -5,7 +5,6 @@ This is the intended always-on Linux install path.
 ## Build
 
 ```bash
-npm ci
 clojure -T:build release
 ```
 
@@ -14,7 +13,7 @@ clojure -T:build release
 ```bash
 sudo useradd --system --home /var/lib/prusa-telemetry --shell /usr/bin/nologin prusa-telemetry
 sudo mkdir -p /opt/prusa-telemetry /etc/prusa-telemetry /var/lib/prusa-telemetry/prints
-sudo cp target/prusa_telemetry-0.1.0-SNAPSHOT.jar /opt/prusa-telemetry/
+sudo cp target/prusa-telemetry.jar /opt/prusa-telemetry/
 sudo cp -r bin /opt/prusa-telemetry/
 sudo cp config/prusa-telemetry.edn.example /etc/prusa-telemetry/prusa-telemetry.edn
 sudo cp install/systemd/prusa-telemetry.service /etc/systemd/system/
@@ -52,10 +51,10 @@ journalctl -u prusa-telemetry -f
 
 ```bash
 sudo systemctl stop prusa-telemetry
-sudo cp target/prusa_telemetry-NEW.jar /opt/prusa-telemetry/
+sudo cp target/prusa-telemetry.jar /opt/prusa-telemetry/
 sudo systemctl start prusa-telemetry
 ```
 
 If you pin `PRUSA_TELEMETRY_JAR` in the service, update that path during
-upgrades. Otherwise `bin/prusa-telemetry` picks the newest matching jar in the
-install directory.
+upgrades. Otherwise `bin/prusa-telemetry` uses `prusa-telemetry.jar` when it is
+present, then falls back to the newest versioned jar in the install directory.

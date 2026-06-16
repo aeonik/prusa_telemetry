@@ -18,7 +18,6 @@ show the exact jar name.
 ## Local Release Checklist
 
 ```bash
-npm ci
 clojure -M:test
 clojure -T:build release
 git status --short
@@ -29,11 +28,15 @@ git push origin main v0.2.0
 Release artifacts:
 
 ```text
+target/prusa-telemetry.jar
+target/prusa-telemetry.jar.sha256
 target/prusa_telemetry-VERSION.jar
 target/prusa_telemetry-VERSION.jar.sha256
 ```
 
 ## CI
 
-The GitHub Actions workflow runs tests, compiles both ClojureScript builds, and
-builds the release jar. Tag pushes create release artifacts.
+The GitHub Actions workflow installs Java, the Clojure CLI, and Node. Clojure
+CLI drives the tests and release build; npm is only used by the build to install
+React packages needed for ClojureScript compilation. Tag pushes create release
+artifacts.

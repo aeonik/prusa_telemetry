@@ -74,54 +74,51 @@ Supported install paths:
 - Releases and tagging: [docs/releases.md](docs/releases.md)
 - Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
+Quick jar install:
+
+```bash
+curl -L -o prusa-telemetry.jar \
+  https://github.com/aeonik/prusa_telemetry/releases/latest/download/prusa-telemetry.jar
+curl -L -o prusa-telemetry.jar.sha256 \
+  https://github.com/aeonik/prusa_telemetry/releases/latest/download/prusa-telemetry.jar.sha256
+sha256sum -c prusa-telemetry.jar.sha256
+java -jar prusa-telemetry.jar
+```
+
 Quick source install:
 
 ```bash
 cp config/prusa-telemetry.edn.example config/prusa-telemetry.edn
-npm ci
-clojure -M:shadow-cljs compile app
-clojure -M:shadow-cljs compile replay-worker
-clojure -M:prod:run-web
-```
-
-Quick jar build:
-
-```bash
-npm ci
 clojure -T:build release
+clojure -M:prod:run-web
 ```
 
 Quick developer start:
 
 ```bash
-npm ci
 bin/dev-service start
 ```
 
-### Toolchain with mise
+### Toolchain
 
-We pin the local toolchain through [`mise`](https://mise.jdx.dev/) so the Clojure CLI version stays consistent across machines.
+Runtime installs only need Java. Source builds use the Clojure CLI as the main
+entrypoint:
 
-1. Trust the repo config (one time):
-   ```bash
-   mise trust
-   ```
-2. Install the pinned CLI (see `.mise.toml` for the exact version):
-   ```bash
-   mise install clojure
-   ```
-3. Verify the CLI is available:
-   ```bash
-   mise exec -- clojure -Sdescribe
-   ```
+```bash
+clojure -T:build release
+```
 
-If an HTTP proxy blocks either `download.clojure.org` (Clojure installer) or `repo.clojars.org` (libraries), `mise install` will fail with a 403 response. Ensure both hosts are whitelisted and retry the install if you see that error.
+The frontend is ClojureScript/Reagent, and Reagent 2 loads React from npm.
+Because of that, source builds also need Node/npm available so the Clojure build
+or dev script can install the React packages before compiling browser assets.
+npm is not needed to run the release jar.
 
 ### Build ClojureScript
 
 Compile the ClojureScript frontend to JavaScript:
 
 ```bash
+npm ci
 clojure -M:shadow-cljs compile app
 clojure -M:shadow-cljs compile replay-worker
 ```
@@ -261,14 +258,15 @@ Create a standalone JAR file:
 clojure -T:build release
 ```
 
-This creates `target/prusa_telemetry-0.1.0-SNAPSHOT.jar`
-with `aeonik.web-server` as the entrypoint, so it starts both the UDP
-telemetry listener and HTTP dashboard/archive server.
+This creates `target/prusa-telemetry.jar` plus the versioned
+`target/prusa_telemetry-0.1.0-SNAPSHOT.jar`, with `aeonik.web-server` as the
+entrypoint. Both jar files start the UDP telemetry listener and HTTP
+dashboard/archive server.
 
 Run the jar:
 
 ```bash
-java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar [telemetry-port] [web-port]
+java -jar target/prusa-telemetry.jar [telemetry-port] [web-port]
 ```
 
 ## Usage
@@ -280,11 +278,9 @@ java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar [telemetry-port] [web-port]
    cp config/prusa-telemetry.edn.example config/prusa-telemetry.edn
    ```
 
-2. **Install JS dependencies and build the frontend**:
+2. **Build the frontend and release jar**:
    ```bash
-   npm ci
-   clojure -M:shadow-cljs compile app
-   clojure -M:shadow-cljs compile replay-worker
+   clojure -T:build release
    ```
 
 3. **Start the server**:

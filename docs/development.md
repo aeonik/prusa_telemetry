@@ -8,6 +8,9 @@ The preferred development flow is `bin/dev-service`. It starts:
 - Shadow nREPL
 - optional FlowStorm debugger
 
+The dev script installs missing React packages with `npm ci --ignore-scripts`
+before starting Shadow CLJS.
+
 ```bash
 bin/dev-service start
 ```
