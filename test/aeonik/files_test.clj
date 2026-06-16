@@ -24,9 +24,9 @@
                    [{:sender :buddy
                      :wall-time-str "2025-01-01T00:00:00Z"
                      :wall-time-ms 10
-                     :metrics [{:name "temp" :value 42 :fields {:raw 1} :offset-us 1 :offset-ms 0.001 :type :numeric :device-time-us 2 :device-time-str "2"}]}])]
+                     :metrics [{:name "temp" :value 42 :tags {"n" 0} :fields {:raw 1} :offset-us 1 :offset-ms 0.001 :type :numeric :device-time-us 2 :device-time-str "2"}]}])]
       (is (= [{:sender "buddy" :wall-time-str "2025-01-01T00:00:00Z" :wall-time-ms 10
-               :metrics [{:name "temp" :value 42 :fields {:raw 1} :error nil :type :numeric :offset-us 1 :offset-ms 0.001 :device-time-us 2 :device-time-str "2" :wall-time-ms nil}]}]
+               :metrics [{:name "temp" :value 42 :tags {"n" 0} :fields {:raw 1} :error nil :type :numeric :offset-us 1 :offset-ms 0.001 :device-time-us 2 :device-time-str "2" :wall-time-ms nil}]}]
              (map #(select-keys % [:sender :wall-time-str :wall-time-ms :metrics]) packets)))))
   (testing "Handles missing metrics"
     (let [packets (files/normalize-packets [{:sender :none :metrics nil}])]
@@ -36,7 +36,7 @@
     (let [packets (files/normalize-packets [{:sender "p" :wall-time-str "t" :wall-time-ms "5"
                                             :metrics [{:value 1} "bad"]}])]
       (is (= [{:sender "p" :wall-time-str "t" :wall-time-ms 5
-               :metrics [{:name nil :value 1 :fields nil :error nil :type nil :offset-us nil :offset-ms nil :device-time-us nil :device-time-str nil :wall-time-ms nil}]}]
+               :metrics [{:name nil :value 1 :tags nil :fields nil :error nil :type nil :offset-us nil :offset-ms nil :device-time-us nil :device-time-str nil :wall-time-ms nil}]}]
              (map #(select-keys % [:sender :wall-time-str :wall-time-ms :metrics]) packets)))))
   (testing "Returns empty for non-sequential input"
     (is (= [] (files/normalize-packets {:not-a-seq true})))))

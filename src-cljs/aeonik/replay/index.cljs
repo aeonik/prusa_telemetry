@@ -31,8 +31,8 @@
     build))
 
 (defn- metric-key
-  [sender metric-name]
-  [(or sender "") (or metric-name "")])
+  [sender metric-name tags]
+  [(or sender "") (or metric-name "") (te/tag-key tags)])
 
 (defn- empty-series
   [key sender metric-name metric-type print-filename]
@@ -43,6 +43,7 @@
    :print-filename print-filename
    :packet-msgs (array)
    :values (array)
+   :tags (array)
    :fields (array)
    :errors (array)
    :offset-us (array)
@@ -61,6 +62,9 @@
       (some? (aget (:values series) idx))
       (assoc :value (aget (:values series) idx))
 
+      (some? (aget (:tags series) idx))
+      (assoc :tags (aget (:tags series) idx))
+
       (some? (aget (:fields series) idx))
       (assoc :fields (aget (:fields series) idx))
 
@@ -74,9 +78,10 @@
       (assoc :device-time-us (aget (:device-time-us series) idx)))))
 
 (defn- append-sample!
-  [series {:keys [packet-msg value fields error offset-us device-time-us]}]
+  [series {:keys [packet-msg value tags fields error offset-us device-time-us]}]
   (.push (:packet-msgs series) packet-msg)
   (.push (:values series) value)
+  (.push (:tags series) tags)
   (.push (:fields series) fields)
   (.push (:errors series) error)
   (.push (:offset-us series) offset-us)
@@ -136,8 +141,8 @@
       series)))
 
 (defn- add-sample
-  [build sender print-filename metric-name metric-type sample]
-  (let [key (metric-key sender metric-name)
+  [build sender print-filename metric-name metric-type tags sample]
+  (let [key (metric-key sender metric-name tags)
         existing-series (get-in build [:series key])
         new-series? (nil? existing-series)]
     (cond-> (assoc-in build [:series key]
@@ -173,11 +178,12 @@
                                                     {:name (str metric-name "." field-name)
                                                      :sample {:packet-msg packet-msg
                                                               :value numeric-value
+                                                              :tags (:tags metric)
                                                               :device-time-us (:device-time-us metric)}}))))
                                         vec)
                                    [])]
     (reduce (fn [acc {:keys [name sample]}]
-              (add-sample acc sender print-filename name "numeric" sample))
+              (add-sample acc sender print-filename name "numeric" (:tags sample) sample))
             (if (seq structured-field-samples)
               build
               (add-sample build
@@ -185,8 +191,10 @@
                           print-filename
                           metric-name
                           metric-type
+                          (:tags metric)
                           {:packet-msg packet-msg
                            :value (:value metric)
+                           :tags (:tags metric)
                            :fields (:fields metric)
                            :error (:error metric)
                            :offset-us (:offset-us metric)

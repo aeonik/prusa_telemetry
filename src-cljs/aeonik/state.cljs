@@ -1,5 +1,6 @@
 (ns aeonik.state
-  (:require [reagent.core :as r]
+  (:require [aeonik.telemetry-events :as te]
+            [reagent.core :as r]
             [reagent.ratom :as ratom]))
 
 (def ^:private storage-key "prusa-telemetry-state")
@@ -72,7 +73,7 @@
 (defn get-latest-values
   "Derive latest-values map from telemetry-events"
   [events]
-  (let [grouped (group-by (fn [e] (str (:sender e) "/" (:name e))) events)
+  (let [grouped (group-by te/metric-key events)
         latest-map (reduce-kv (fn [acc k events]
                                 (let [sorted (sort-by (fn [e] (or (:device-time-us e) 0)) events)
                                       latest (last sorted)]
@@ -101,6 +102,7 @@
                                                   metrics-list (map (fn [e]
                                                                      {:name (:name e)
                                                                       :value (:value e)
+                                                                      :tags (:tags e)
                                                                       :fields (:fields e)
                                                                       :error (:error e)
                                                                       :type (:type e)

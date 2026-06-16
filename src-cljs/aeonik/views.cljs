@@ -32,9 +32,9 @@
          [:th "Time"]]]
        [:tbody
         (map (fn [metric]
-               [:tr {:key (str (:sender metric) "/" (:name metric))}
+               [:tr {:key (str (:sender metric) "/" (te/metric-display-name metric))}
                 [:td (:sender metric)]
-                [:td (:name metric)]
+                [:td (te/metric-display-name metric)]
                 [:td (u/format-metric-value metric)]
                 [:td (:type metric)]
                 [:td (or (:device-time-str metric) "--------")]])
@@ -65,9 +65,9 @@
                              [:th "Value"]]]
                            [:tbody
                             (map-indexed (fn [m-idx metric]
-                                           [:tr {:key (str "metric-" idx "-" m-idx "-" (:name metric))}
+                                           [:tr {:key (str "metric-" idx "-" m-idx "-" (te/metric-display-name metric))}
                                             [:td (or (:device-time-str metric) "--------")]
-                                            [:td (:name metric)]
+                                            [:td (te/metric-display-name metric)]
                                             [:td (u/format-metric-value metric)]])
                                          metrics)]])]))
                    (reverse packets)))))
@@ -204,9 +204,9 @@
        [:th "Wall Time"]]]
      [:tbody
       (map-indexed (fn [idx metric]
-             [:tr {:key (str (:sender metric) "/" (:name metric) "/" (or (:device-time-us metric) (:offset-us metric) idx))}
+             [:tr {:key (str (:sender metric) "/" (te/metric-display-name metric) "/" (or (:device-time-us metric) (:offset-us metric) idx))}
               [:td (:sender metric)]
-              [:td (:name metric)]
+              [:td (te/metric-display-name metric)]
               [:td (u/format-metric-value metric)]
               [:td (:type metric)]
               [:td (or (:device-time-str metric) "--------")]
@@ -284,7 +284,7 @@
                                    (<= current-packet-msg (:max packet-range)))
                            (u/get-metrics-at-packet timeline-data print-filename current-packet-msg)
                            [])
-        sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-packet)]
+        sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (te/metric-display-name m))) metrics-at-packet)]
     [:div {:class "timeline-view"}
      [:div {:class "timeline-controls"}
       (timeline-filename-selector available-files)
@@ -535,7 +535,7 @@
                         (format-dashboard-number (:latest stats))
                         (u/format-metric-value latest))
         sender (:sender latest)
-        metric-name (:name latest)]
+        metric-name (te/metric-display-name latest)]
     [:article {:class (str "metric-card" (when-not numeric? " metric-card-text"))}
      [:div {:class "metric-card-head"}
       [:div {:class "metric-title-wrap"}
@@ -596,7 +596,7 @@
                    (filter dashboard-visible-metric?)
                    (sort-by (fn [metric]
                               [(if (te/metric-number metric) 0 1)
-                               (str/lower-case (or (:name metric) ""))
+                               (str/lower-case (or (te/metric-display-name metric) ""))
                                (str (:sender metric))])))]
 	    [:div {:class "dashboard-view"}
      [prusalink-print-panel app-state latest-values]
@@ -607,7 +607,7 @@
         (map (fn [metric]
                (let [key (te/metric-key metric)
                      history (get histories key [])]
-                 ^{:key (str (first key) "/" (second key))}
+                 ^{:key (str/join "/" (map str key))}
                  [metric-card metric history]))
              cards)])]))
 
@@ -768,7 +768,7 @@
 
                          :else "--")
         sender (:sender latest)
-        metric-name (:name latest)]
+        metric-name (te/metric-display-name latest)]
     [:article {:class (str "replay-metric-card" (when-not numeric? " replay-metric-card-text"))}
      [:div {:class "metric-card-head"}
       [:div {:class "metric-title-wrap"}
@@ -861,12 +861,12 @@
             (js/setTimeout #(dispatch! {:type :timeline/set-packet-msg :packet-msg current-packet-msg}) 0))
         packet (replay-packet-at replay-data current-packet-msg)
         metrics-at-packet (replay-index/events-at-packet replay-data current-packet-msg)
-        sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (:name m))) metrics-at-packet)
+        sorted-metrics (sort-by (fn [m] (str (:sender m) "/" (te/metric-display-name m))) metrics-at-packet)
         cards (->> (:metric-cards replay-data)
                    (filter #(dashboard-visible-metric? (:latest %)))
                    (sort-by (fn [metric]
                               [(if (:numeric? metric) 0 1)
-                               (str/lower-case (or (:name metric) ""))
+                               (str/lower-case (or (te/metric-display-name metric) ""))
                                (str (:sender metric))])))
         status-view (replay-load-status replay)]
     [:div {:class "replay-view"}
@@ -893,8 +893,8 @@
           :else
           [:div {:class "replay-metrics-grid"}
            (map (fn [summary]
-                  (let [[sender metric-name] (:key summary)]
-                    ^{:key (str sender "/" metric-name)}
+                  (let [key (:key summary)]
+                    ^{:key (str/join "/" (map str key))}
                     [replay-metric-card summary current-packet-msg]))
                 cards)])]
        [:section {:class "replay-current-panel"}
