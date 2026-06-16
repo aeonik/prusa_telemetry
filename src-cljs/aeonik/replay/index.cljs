@@ -1,5 +1,6 @@
 (ns aeonik.replay.index
-  (:require [aeonik.telemetry-events :as te]))
+  (:require [aeonik.telemetry-events :as te]
+            [aeonik.util :as u]))
 
 (defn empty-build
   "Create an incremental replay index build."
@@ -29,25 +30,26 @@
         (update :max-msg #(if (number? %) (max % packet-msg) packet-msg)))
     build))
 
-(defn- compact-sample
-  [event]
-  (select-keys event
-               [:value
-                :fields
-                :error
-                :type
-                :offset-us
-                :offset-ms
-                :device-time-us
-                :device-time-str
-                :wall-time-str
-                :wall-time-ms
-                :packet-msg
-                :received-at
-                :has-numeric-fields?
-                :parent-name
-                :field-name
-                :synthetic-field?]))
+(defn- metric-key
+  [sender metric-name]
+  [(or sender "") (or metric-name "")])
+
+(defn- metric-sample
+  [wall-time-str wall-time-ms packet-msg received-at metric]
+  (cond-> {:value (:value metric)
+           :fields (:fields metric)
+           :error (:error metric)
+           :type (te/metric-type-name (:type metric))
+           :offset-us (:offset-us metric)
+           :offset-ms (:offset-ms metric)
+           :device-time-us (:device-time-us metric)
+           :device-time-str (:device-time-str metric)
+           :wall-time-str wall-time-str
+           :wall-time-ms wall-time-ms
+           :packet-msg packet-msg
+           :received-at received-at}
+    (:has-numeric-fields? metric)
+    (assoc :has-numeric-fields? true)))
 
 (defn sample->event
   "Rehydrate one compact sample into the event shape expected by existing views."
@@ -57,6 +59,12 @@
            :sender (:sender series)
            :name (:name series)
            :print-filename (:print-filename series))))
+
+(defn- sample-number
+  [sample]
+  (let [value (:value sample)]
+    (when (te/finite-number? value)
+      value)))
 
 (defn- update-numeric-stats
   [series value]
@@ -75,15 +83,14 @@
            :max (if (number? (:max series)) (max (:max series) value) value))))
 
 (defn- add-sample-to-series
-  [series event]
-  (let [sample (compact-sample event)
-        value (te/metric-number event)
+  [series key sender metric-name metric-type print-filename sample]
+  (let [value (sample-number sample)
         series (-> (or series {})
-                   (assoc :key (te/metric-key event)
-                          :sender (:sender event)
-                          :name (:name event)
-                          :type (:type event)
-                          :print-filename (:print-filename event)
+                   (assoc :key key
+                          :sender sender
+                          :name metric-name
+                          :type metric-type
+                          :print-filename print-filename
                           :latest-sample sample)
                    (update :event-count (fnil inc 0))
                    (update :samples (fnil conj []) sample))]
@@ -91,15 +98,59 @@
       (update-numeric-stats series value)
       series)))
 
-(defn- update-series
-  [build event]
-  (let [key (te/metric-key event)
+(defn- add-sample
+  [build sender print-filename metric-name metric-type sample]
+  (let [key (metric-key sender metric-name)
         existing-series (get-in build [:series key])
         new-series? (nil? existing-series)]
     (cond-> (assoc-in build [:series key]
-                      (add-sample-to-series existing-series event))
+                      (add-sample-to-series existing-series
+                                            key
+                                            sender
+                                            metric-name
+                                            metric-type
+                                            print-filename
+                                            sample))
       new-series?
       (update :series-order conj key))))
+
+(defn- field-name-str
+  [field-name]
+  (if (keyword? field-name)
+    (name field-name)
+    (str field-name)))
+
+(defn- add-metric-samples
+  [build sender print-filename wall-time-str wall-time-ms packet-msg received-at metric]
+  (let [metric-name (:name metric)
+        metric-type (te/metric-type-name (:type metric))
+        fields (te/field-entries (:fields metric))
+        structured-field-samples (when (= metric-type "structured")
+                                   (keep (fn [[field-name field-value]]
+                                           (when-let [numeric-value (te/parse-numeric-like field-value)]
+                                             (let [field-name (field-name-str field-name)]
+                                               {:name (str metric-name "." field-name)
+                                                :sample (-> (metric-sample wall-time-str
+                                                                           wall-time-ms
+                                                                           packet-msg
+                                                                           received-at
+                                                                           metric)
+                                                            (assoc :value numeric-value
+                                                                   :fields nil
+                                                                   :type "numeric"
+                                                                   :parent-name metric-name
+                                                                   :field-name field-name
+                                                                   :synthetic-field? true)
+                                                            (dissoc :error))})))
+                                         fields))
+        base-metric (cond-> metric
+                      (seq structured-field-samples)
+                      (assoc :has-numeric-fields? true))
+        base-sample (metric-sample wall-time-str wall-time-ms packet-msg received-at base-metric)]
+    (reduce (fn [acc {:keys [name sample]}]
+              (add-sample acc sender print-filename name "numeric" sample))
+            (add-sample build sender print-filename metric-name metric-type base-sample)
+            structured-field-samples)))
 
 (defn add-packet
   "Add one telemetry packet to an incremental replay index build."
@@ -111,17 +162,29 @@
         received-at (:received-at packet)
         print-filename (or (te/extract-print-filename-from-metrics metrics)
                            (:print-filename build))
-        events (te/create-events sender metrics wall-time-str print-filename packet-msg received-at)
+        wall-time-ms (u/parse-wall-time-str wall-time-str)
         packet-meta {:packet-msg packet-msg
                      :received-at received-at
                      :wall-time-str wall-time-str
                      :sender sender
-                     :metric-count (count events)}
-        packet-index (count (:packets build))]
-    (-> (reduce update-series build events)
+                     :metric-count nil}
+        packet-index (count (:packets build))
+        event-count-before (:event-count build)
+        updated-build (reduce (fn [acc metric]
+                                (add-metric-samples acc
+                                                    sender
+                                                    print-filename
+                                                    wall-time-str
+                                                    wall-time-ms
+                                                    packet-msg
+                                                    received-at
+                                                    metric))
+                              build
+                              metrics)
+        sample-count (- (:event-count updated-build) event-count-before)]
+    (-> updated-build
         (update :packet-count inc)
-        (update :event-count + (count events))
-        (update :packets conj packet-meta)
+        (update :packets conj (assoc packet-meta :metric-count sample-count))
         (assoc-in [:packet-index packet-msg] packet-index)
         (cond-> print-filename (assoc :print-filename print-filename))
         (update-range packet-msg))))
