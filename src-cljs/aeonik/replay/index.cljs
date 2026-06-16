@@ -34,23 +34,54 @@
   [sender metric-name]
   [(or sender "") (or metric-name "")])
 
-(defn- metric-sample
-  [packet-msg metric]
-  (cond-> {:packet-msg packet-msg}
-    (contains? metric :value)
-    (assoc :value (:value metric))
+(defn- empty-series
+  [key sender metric-name metric-type print-filename]
+  {:key key
+   :sender sender
+   :name metric-name
+   :type metric-type
+   :print-filename print-filename
+   :packet-msgs (array)
+   :values (array)
+   :fields (array)
+   :errors (array)
+   :offset-us (array)
+   :device-time-us (array)})
 
-    (:fields metric)
-    (assoc :fields (:fields metric))
+(defn- sample-count
+  [series]
+  (alength (:packet-msgs series)))
 
-    (:error metric)
-    (assoc :error (:error metric))
+(defn- sample-at-index
+  [series idx]
+  (when (and (number? idx)
+             (<= 0 idx)
+             (< idx (sample-count series)))
+    (cond-> {:packet-msg (aget (:packet-msgs series) idx)}
+      (some? (aget (:values series) idx))
+      (assoc :value (aget (:values series) idx))
 
-    (:offset-us metric)
-    (assoc :offset-us (:offset-us metric))
+      (some? (aget (:fields series) idx))
+      (assoc :fields (aget (:fields series) idx))
 
-    (:device-time-us metric)
-    (assoc :device-time-us (:device-time-us metric))))
+      (some? (aget (:errors series) idx))
+      (assoc :error (aget (:errors series) idx))
+
+      (some? (aget (:offset-us series) idx))
+      (assoc :offset-us (aget (:offset-us series) idx))
+
+      (some? (aget (:device-time-us series) idx))
+      (assoc :device-time-us (aget (:device-time-us series) idx)))))
+
+(defn- append-sample!
+  [series {:keys [packet-msg value fields error offset-us device-time-us]}]
+  (.push (:packet-msgs series) packet-msg)
+  (.push (:values series) value)
+  (.push (:fields series) fields)
+  (.push (:errors series) error)
+  (.push (:offset-us series) offset-us)
+  (.push (:device-time-us series) device-time-us)
+  series)
 
 (defn sample->event
   "Rehydrate one compact sample into the event shape expected by existing views."
@@ -90,15 +121,16 @@
 (defn- add-sample-to-series
   [series key sender metric-name metric-type print-filename sample]
   (let [value (sample-number sample)
-        series (-> (or series {})
-                   (assoc :key key
-                          :sender sender
-                          :name metric-name
-                          :type metric-type
-                          :print-filename print-filename
-                          :latest-sample sample)
-                   (update :event-count (fnil inc 0))
-                   (update :samples (fnil conj []) sample))]
+        series (append-sample! (or series
+                                   (empty-series key
+                                                 sender
+                                                 metric-name
+                                                 metric-type
+                                                 print-filename))
+                               sample)
+        series (-> series
+                   (assoc :latest-idx (dec (sample-count series)))
+                   (update :event-count (fnil inc 0)))]
     (if (number? value)
       (update-numeric-stats series value)
       series)))
@@ -141,10 +173,7 @@
                                                     {:name (str metric-name "." field-name)
                                                      :sample {:packet-msg packet-msg
                                                               :value numeric-value
-                                                              :device-time-us (:device-time-us metric)
-                                                              :parent-name metric-name
-                                                              :field-name field-name
-                                                              :synthetic-field? true}}))))
+                                                              :device-time-us (:device-time-us metric)}}))))
                                         vec)
                                    [])]
     (reduce (fn [acc {:keys [name sample]}]
@@ -156,7 +185,12 @@
                           print-filename
                           metric-name
                           metric-type
-                          (metric-sample packet-msg metric)))
+                          {:packet-msg packet-msg
+                           :value (:value metric)
+                           :fields (:fields metric)
+                           :error (:error metric)
+                           :offset-us (:offset-us metric)
+                           :device-time-us (:device-time-us metric)}))
             structured-field-samples)))
 
 (defn add-packet
@@ -204,7 +238,7 @@
 
 (defn- finalize-series
   [series]
-  (let [latest (sample->event series (:latest-sample series))]
+  (let [latest (sample->event series (sample-at-index series (:latest-idx series)))]
     (cond-> (assoc series :latest latest)
       (:numeric? series)
       (assoc :stats (series-stats series)))))
@@ -248,16 +282,16 @@
 (defn last-sample-index-at
   "Return the last sample index at or before packet-msg."
   [series packet-msg]
-  (let [samples (:samples series)]
-    (when (and (seq samples) (number? packet-msg))
+  (let [packet-msgs (:packet-msgs series)
+        sample-count (sample-count series)]
+    (when (and (pos? sample-count) (number? packet-msg))
       (loop [lo 0
-             hi (dec (count samples))
+             hi (dec sample-count)
              best nil]
         (if (> lo hi)
           best
           (let [mid (js/Math.floor (/ (+ lo hi) 2))
-                sample (nth samples mid)
-                sample-msg (:packet-msg sample)]
+                sample-msg (aget packet-msgs mid)]
             (if (and (number? sample-msg) (<= sample-msg packet-msg))
               (recur (inc mid) hi mid)
               (recur lo (dec mid) best))))))))
@@ -266,7 +300,7 @@
   "Return the last compact sample at or before packet-msg."
   [series packet-msg]
   (when-let [idx (last-sample-index-at series packet-msg)]
-    (nth (:samples series) idx)))
+    (sample-at-index series idx)))
 
 (defn event-at-or-before
   "Return the last event-shaped sample at or before packet-msg."
@@ -276,12 +310,27 @@
 (defn sample-window-at
   "Return up to limit compact samples ending at packet-msg."
   [series packet-msg limit]
-  (let [samples (:samples series)
-        idx (last-sample-index-at series packet-msg)]
-    (if (and (number? idx) (vector? samples))
+  (let [idx (last-sample-index-at series packet-msg)]
+    (if (number? idx)
       (let [end (inc idx)
             start (max 0 (- end limit))]
-        (subvec samples start end))
+        (mapv #(sample-at-index series %) (range start end)))
+      [])))
+
+(defn numeric-window-values-at
+  "Return up to limit numeric values ending at packet-msg."
+  [series packet-msg limit]
+  (let [values (:values series)
+        idx (last-sample-index-at series packet-msg)]
+    (if (number? idx)
+      (let [end (inc idx)
+            start (max 0 (- end limit))]
+        (->> (range start end)
+             (keep (fn [sample-idx]
+                     (let [value (aget values sample-idx)]
+                       (when (te/finite-number? value)
+                         value))))
+             vec))
       [])))
 
 (defn event-window-at
@@ -297,16 +346,16 @@
     []
     (->> (:metric-cards index)
          (mapcat
-          (fn [series]
-            (let [samples (:samples series)
+         (fn [series]
+            (let [packet-msgs (:packet-msgs series)
                   idx (last-sample-index-at series packet-msg)]
               (loop [idx idx
                      acc '()]
                 (if (and (number? idx)
                          (>= idx 0)
-                         (= packet-msg (:packet-msg (nth samples idx))))
+                         (= packet-msg (aget packet-msgs idx)))
                   (recur (dec idx)
-                         (conj acc (sample->event series (nth samples idx))))
+                         (conj acc (sample->event series (sample-at-index series idx))))
                   acc)))))
          (sort-by (fn [event]
                     [(str (:sender event))

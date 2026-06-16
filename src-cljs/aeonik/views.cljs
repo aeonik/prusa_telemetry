@@ -742,8 +742,10 @@
 (defn- replay-metric-card [summary current-packet-msg]
   (let [latest (:latest summary)
         selected-sample (replay-index/sample-at-or-before summary current-packet-msg)
-        window-samples (replay-index/sample-window-at summary current-packet-msg replay-spark-window)
-        numeric-values (keep sample-number window-samples)
+        numeric-values (replay-index/numeric-window-values-at
+                        summary
+                        current-packet-msg
+                        replay-spark-window)
         numeric? (:numeric? summary)
         stats (metric-stats numeric-values)
         selected-value (cond
