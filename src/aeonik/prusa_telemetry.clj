@@ -353,12 +353,16 @@
   "Default processing pipeline.
    Each stage is [name stage] where stage is either:
    - A transducer (use directly)
-   - A function (wrap in map)"
-  [[:parse       (map parse-packet)]      ;; transducer
+   - A function (wrap in map)
+
+   Stage functions are stored as Vars so CIDER namespace reloads update the
+   behavior of an already-running pipeline. Changing the stage graph itself
+   still requires a telemetry restart."
+  [[:parse       (map #'parse-packet)]      ;; transducer
    [:filter-err  (remove :error)]          ;; transducer  
-   [:sort        (map sort-metrics)]       ;; transducer
-   [:timestamps  (map add-timestamps)]     ;; transducer
-   [:display     (map add-display-lines)]]) ;; transducer
+   [:sort        (map #'sort-metrics)]       ;; transducer
+   [:timestamps  (map #'add-timestamps)]     ;; transducer
+   [:display     (map #'add-display-lines)]]) ;; transducer
 
 (defn start-telemetry-server
   [{:keys [port stages sinks]
@@ -381,19 +385,29 @@
         active-sinks (into {}
                            (map (fn [[sink-name spec]]
                                   (let [branch (s/stream 100)
-                                        _ (s/connect fan-out branch {:description (str "fan-out → " (name sink-name))})
+                                        _ (s/connect fan-out
+                                                     branch
+                                                     {:description (str "fan-out → " (name sink-name))
+                                                      :upstream? false
+                                                      :downstream? true})
                                         sink (create-sink (assoc spec :stream branch))]
                                     [sink-name sink])))
                            sinks)]
 
     {:socket socket
+     :config {:port port
+              :stages (mapv first stages)}
      :input-buffer input-buffer
      :pipeline-out pipeline-out
      :fan-out fan-out
      :sinks active-sinks
      :tap (fn []
             (let [t (s/stream 100)]
-              (s/connect fan-out t {:description "fan-out → tap"})
+              (s/connect fan-out
+                         t
+                         {:description "fan-out → tap"
+                          :upstream? false
+                          :downstream? true})
               t))
 
      ;; Topology as data

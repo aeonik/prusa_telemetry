@@ -26,6 +26,16 @@
 (defonce xtdb-node (atom nil))
 (defonce sinks (atom {}))  ;; {name -> stream}
 
+(def reloadable-namespaces
+  "Backend namespaces that are safe to reload during normal REPL development."
+  '[aeonik.archive
+    aeonik.prusalink
+    aeonik.prusalink-state
+    aeonik.prusalink-proxy
+    aeonik.prusa-telemetry
+    aeonik.ws-bridge
+    aeonik.web-server])
+
 ;; ============================================================
 ;; Sink management
 ;; ============================================================
@@ -88,7 +98,7 @@
      (reset! web-server
             (web/start-web-server {:port port
                                     :telemetry-stream (:fan-out @telemetry-server)}))
-     (println "✓ Web on port" port "| ws://localhost:" port "/ws"))
+     (println (format "✓ Web on port %d | ws://localhost:%d/ws" port port)))
    @web-server))
 
 (defn stop-web! []
@@ -143,6 +153,74 @@
   (stop!)
   (Thread/sleep 300)
   (start!))
+
+(defn- service-port
+  "Return the remembered service port, falling back to default-port."
+  [service default-port]
+  (or (get-in service [:config :port]) default-port))
+
+(defn reload-namespaces!
+  "Reload backend namespaces from source."
+  []
+  (doseq [ns-sym reloadable-namespaces]
+    (require ns-sym :reload))
+  (println "✓ Backend namespaces reloaded")
+  reloadable-namespaces)
+
+(defn reload-web-handler!
+  "Reinstall the live web request handler without closing the HTTP listener.
+
+   If the running server predates the hot-reload delegate, this returns
+   :needs-stream-restart so callers can do one transitional restart."
+  []
+  (if @web-server
+    (let [result (web/reload-request-handler!)]
+      (if (= :not-running (:status result))
+        (do
+          (println "✗ Live web delegate is not installed yet")
+          {:status :needs-stream-restart})
+        (do
+          (println "✓ Web handler reloaded")
+          result)))
+    (do
+      (println "✗ Web not running")
+      {:status :not-running})))
+
+(defn restart-streams!
+  "Restart telemetry and web streams inside the current JVM.
+
+   Use this after changing the telemetry stream graph, listener setup, or when
+   upgrading an already-running service to the hot-reload delegate."
+  []
+  (let [telemetry-running? (some? @telemetry-server)
+        web-running? (some? @web-server)
+        telemetry-port (service-port @telemetry-server 8514)
+        web-port (service-port @web-server 8080)]
+    (when web-running? (stop-web!))
+    (when telemetry-running? (stop-telemetry!))
+    (when telemetry-running? (start-telemetry! {:port telemetry-port}))
+    (when web-running? (start-web! {:port web-port}))
+    (status)))
+
+(defn reload!
+  "Reload backend code and refresh the running services.
+
+   Normal use:
+     (reload!)
+
+   Use the stronger form after changing stream topology or listener setup:
+     (reload! {:restart-streams? true})"
+  ([] (reload! {}))
+  ([{:keys [restart-streams?]
+     :or {restart-streams? false}}]
+   (reload-namespaces!)
+   (if restart-streams?
+     (restart-streams!)
+     (let [web-result (reload-web-handler!)]
+       (when (= :needs-stream-restart (:status web-result))
+         (println "Restarting streams once to install the live delegate...")
+         (restart-streams!))
+       (status)))))
 
 ;; ============================================================
 ;; Inspection

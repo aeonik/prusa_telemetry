@@ -13,11 +13,17 @@
    [clojure.java.io :as io]
    [clojure.string :as str]))
 
-(def ^:private prusalink-print-state
+(defonce ^:private prusalink-print-state
   (atom prusalink-state/initial-state))
 
-(def ^:private archive-state
+(defonce ^:private archive-state
   (archive/make-state {:prusalink-state prusalink-print-state}))
+
+(defonce ^:private live-handler
+  (atom nil))
+
+(defonce ^:private live-config
+  (atom nil))
 
 (defn index-handler
   "Serve the main HTML page"
@@ -103,11 +109,17 @@
 (defn- setup-packet-saving-consumer
   "Set up a single consumer for saving packets (runs once per packet, not per WebSocket client).
    Creates subscription stream and connects to telemetry stream to ensure we see every packet.
-   telemetry-stream: manifold stream from telemetry server (fan-out stream)"
+   telemetry-stream: manifold stream from telemetry server (fan-out stream).
+
+   Returns a stop function that closes the saving branch."
   [telemetry-stream]
   (let [saving-stream (s/stream 100)
         _ (println "Setting up packet saving consumer, connecting to telemetry-stream...")
-        _ (s/connect telemetry-stream saving-stream {:description "fan-out → saving-stream"})]
+        _ (s/connect telemetry-stream
+                     saving-stream
+                     {:description "fan-out → saving-stream"
+                      :upstream? false
+                      :downstream? true})]
     (let [saving-consumer (s/consume 
                            (fn [packet]
                              (try
@@ -123,7 +135,10 @@
                      (fn [_] nil)
                      (fn [error]
                        (println "ERROR: Packet saving consumer failed:" (.getMessage error))
-                       (.printStackTrace error))))))
+                       (.printStackTrace error)))
+      (fn stop-saving-consumer! []
+        (when-not (s/closed? saving-stream)
+          (s/close! saving-stream))))))
 
 (defn- timeline-handler
   "Serve the timeline HTML page"
@@ -191,20 +206,28 @@
          :body "app.js not found"}))))
 
 (defn- create-routes
-  "Create the route map for the HTTP server"
+  "Create the route map for the HTTP server.
+
+   Route entries intentionally call through Vars or small wrappers so namespace
+   reloads update request behavior without rebuilding the route map."
   [telemetry-stream]
-  {"/" index-handler
-   "/timeline" timeline-handler
-   "/dashboard" dashboard-handler
-   "/replay" dashboard-handler
-   "/ws" (ws-bridge/websocket-handler telemetry-stream)
-   "/api/telemetry-files" list-telemetry-files-handler
-   "/api/prusalink/auth" prusalink-proxy/auth-status-handler
-   "/api/prusalink/print-state" (prusalink-proxy/print-state-handler prusalink-print-state)
-   "/api/prusalink/status" (prusalink-proxy/proxy-handler "/api/v1/status")
-   "/api/prusalink/job" (prusalink-proxy/proxy-handler "/api/v1/job")
-   "/api/prusalink/connection" (prusalink-proxy/proxy-handler "/api/connection")
-   "/app.js" app-js-handler})
+  {"/" #'index-handler
+   "/timeline" #'timeline-handler
+   "/dashboard" #'dashboard-handler
+   "/replay" #'dashboard-handler
+   "/ws" (fn [req]
+           ((ws-bridge/websocket-handler telemetry-stream) req))
+   "/api/telemetry-files" #'list-telemetry-files-handler
+   "/api/prusalink/auth" #'prusalink-proxy/auth-status-handler
+   "/api/prusalink/print-state" (fn [req]
+                                  ((prusalink-proxy/print-state-handler prusalink-print-state) req))
+   "/api/prusalink/status" (fn [req]
+                             ((prusalink-proxy/proxy-handler "/api/v1/status") req))
+   "/api/prusalink/job" (fn [req]
+                          ((prusalink-proxy/proxy-handler "/api/v1/job") req))
+   "/api/prusalink/connection" (fn [req]
+                                 ((prusalink-proxy/proxy-handler "/api/connection") req))
+   "/app.js" #'app-js-handler})
 
 (defn- create-request-handler
   "Create the main request handler that routes requests to appropriate handlers"
@@ -257,6 +280,41 @@
          :headers {"Content-Type" "text/plain"}
          :body "Server error"}))))
 
+(defn- build-request-handler
+  "Build a fresh request handler from the current code and runtime inputs."
+  [telemetry-stream]
+  (-> telemetry-stream
+      create-routes
+      create-request-handler))
+
+(defn reload-request-handler!
+  "Rebuild the live request handler without closing the HTTP listener.
+
+   This is the backend half of the hot-reload workflow. Reload namespaces first,
+   then call this function so the stable Aleph handler delegates to fresh route
+   and WebSocket implementations."
+  []
+  (if-let [{:keys [telemetry-stream]} @live-config]
+    (do
+      (reset! live-handler (build-request-handler telemetry-stream))
+      {:status :reloaded})
+    {:status :not-running}))
+
+(defn- unavailable-handler
+  "Return a 503 before the live handler is installed."
+  [_req]
+  {:status 503
+   :headers {"Content-Type" "text/plain"}
+   :body "Web server handler is not ready"})
+
+(defn- live-request-handler
+  "Stable handler passed to Aleph.
+
+   Aleph keeps this function object for the life of the listener, so it only
+   derefs live-handler and never closes over route tables directly."
+  [req]
+  ((or @live-handler unavailable-handler) req))
+
 (defn- start-http-server
   "Start the HTTP server with the given handler and port"
   [handler port]
@@ -292,22 +350,27 @@
   (println "Starting web server with telemetry-stream:" (type telemetry-stream))
   (println "Telemetry stream closed?" (try (s/closed? telemetry-stream) (catch Exception _ "unknown")))
 
-  ;; Set up packet saving consumer
-  (setup-packet-saving-consumer telemetry-stream)
-  
-  ;; Create routes and handler
-  (let [stop-prusalink-poller! (prusalink-state/start-poller! prusalink-print-state)
-        routes (create-routes telemetry-stream)
-        handler (create-request-handler routes)
-        server (start-http-server handler port)]
+  ;; Create a stable delegating handler. The handler implementation itself can
+  ;; be refreshed by calling reload-request-handler! after namespace reloads.
+  (let [stop-saving-consumer! (setup-packet-saving-consumer telemetry-stream)
+        stop-prusalink-poller! (prusalink-state/start-poller! prusalink-print-state)
+        _ (reset! live-config {:port port
+                               :telemetry-stream telemetry-stream})
+        _ (reload-request-handler!)
+        server (start-http-server live-request-handler port)]
     
     (println (format "Web server started on http://localhost:%d" port))
     (println (format "WebSocket endpoint: ws://localhost:%d/ws" port))
     (println "Waiting for telemetry packets... (make sure your printer is sending UDP packets to port 8514)")
     
     {:server server
+     :config {:port port}
+     :reload! reload-request-handler!
      :stop! (fn []
               (stop-prusalink-poller!)
+              (stop-saving-consumer!)
+              (reset! live-config nil)
+              (reset! live-handler nil)
               (.close server)
               ::stopped)}))
 

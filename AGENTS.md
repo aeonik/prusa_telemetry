@@ -32,3 +32,14 @@ This document contains guidelines for AI agents working on this codebase.
 - Use multi-line strings for longer docstrings
 - Keep docstrings descriptive and clear
 
+## Development Reload Workflow
+
+Prefer hot reload over full restarts during development.
+
+- After normal backend edits, use `(user/reload!)`. It reloads backend namespaces
+  and swaps the live web handler without closing the HTTP listener or restarting
+  telemetry.
+- Use `(user/reload! {:restart-streams? true})` only when changing UDP listener
+  setup, Manifold stream topology, or the telemetry stage graph.
+- Avoid `user/restart!` unless a whole-service lifecycle reset is actually
+  needed.

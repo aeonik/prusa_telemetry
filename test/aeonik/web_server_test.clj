@@ -2,7 +2,8 @@
   (:require [aeonik.archive :as archive]
             [aeonik.web-server :as web]
             [clojure.data.json :as json]
-            [clojure.test :refer :all]))
+            [clojure.test :refer :all]
+            [manifold.stream :as s]))
 
 (deftest telemetry-file-handler-rejects-traversal
   (with-redefs [archive/read-telemetry-file (fn [_ date filename]
@@ -14,3 +15,26 @@
           body (json/read-str (:body response) :key-fn keyword)]
       (is (= 400 (:status response)))
       (is (= {:error "Invalid archive path"} body)))))
+
+(deftest live-request-handler-can-be-reloaded
+  (let [stream (s/stream)
+        live-config (var-get #'web/live-config)
+        live-handler (var-get #'web/live-handler)
+        original-config @live-config
+        original-handler @live-handler]
+    (try
+      (reset! live-config {:telemetry-stream stream})
+      (with-redefs [web/index-handler (fn [_req]
+                                        {:status 200
+                                         :body "before"})]
+        (is (= {:status :reloaded} (web/reload-request-handler!)))
+        (is (= "before" (:body (#'web/live-request-handler {:uri "/"})))))
+      (with-redefs [web/index-handler (fn [_req]
+                                        {:status 200
+                                         :body "after"})]
+        (is (= {:status :reloaded} (web/reload-request-handler!)))
+        (is (= "after" (:body (#'web/live-request-handler {:uri "/"})))))
+      (finally
+        (reset! live-config original-config)
+        (reset! live-handler original-handler)
+        (s/close! stream)))))

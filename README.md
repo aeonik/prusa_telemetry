@@ -117,8 +117,11 @@ For REPL-driven development with hot reloading - **it just works!**
 ;; Stop all services
 (user/stop!)
 
-;; Restart all services
-(user/restart!)
+;; Reload backend code and refresh the live web handler
+(user/reload!)
+
+;; Restart streams inside the current JVM only when the stream graph changed
+(user/reload! {:restart-streams? true})
 
 ;; Start/stop individual services
 (user/start-telemetry!)
@@ -132,6 +135,10 @@ For REPL-driven development with hot reloading - **it just works!**
 - Always access the app via `http://localhost:9632` during development for REPL support
 - The REPL will show "waiting for shadow-cljs runtimes" until you open the browser page
 - Once the browser loads, the REPL connection completes and you can evaluate ClojureScript code
+- Prefer `(user/reload!)` after backend edits. It reloads source and swaps the
+  live web handler without closing the HTTP listener or restarting telemetry.
+- Use `(user/reload! {:restart-streams? true})` only after changing UDP socket
+  setup, Manifold stream topology, or the telemetry stage graph.
 
 **Stream Architecture**:
 - Telemetry server creates a `fan-out` stream (main distribution point)

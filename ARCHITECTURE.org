@@ -578,7 +578,9 @@ Timeline playback uses a JavaScript interval:
 (user/start-telemetry!)          ; Start telemetry server only
 (user/start-telemetry! {:port 8514 :processed-buffer-size 500000})  ; Custom buffer size
 (user/start-web!)                ; Start web server only
-(user/restart!)                   ; Restart all services
+(user/reload!)                   ; Reload code and swap live web handler
+(user/reload! {:restart-streams? true}) ; Restart telemetry/web streams in JVM
+(user/restart!)                  ; Restart all services
 (user/status)                     ; Check service status
 #+END_SRC
 
@@ -592,11 +594,20 @@ Timeline playback uses a JavaScript interval:
 ** Hot Reloading
 
 - ClojureScript: Automatic via shadow-cljs watch
-- Clojure: Manual reload via REPL (restart services after reload)
+- Clojure: Use =(user/reload!)= after normal backend edits. The HTTP listener
+  calls through a stable delegate, so route, handler, WebSocket, archive, and
+  PrusaLink proxy changes can be reinstalled without closing the listener or
+  restarting telemetry.
+- Telemetry parser/formatter stages call Vars, so edits to those functions take
+  effect after namespace reload once the service has been started with the
+  Var-backed pipeline.
+- Use =(user/reload! {:restart-streams? true})= after changing UDP socket setup,
+  Manifold stream topology, or the telemetry stage graph. This restarts
+  telemetry and web streams inside the current JVM, not the whole dev service.
 
 ** Common Issues
 
-- Data flow stops after reload: Restart web server (=user/restart!=)
+- Handler did not change after reload: run =(user/reload!)= after CIDER reloads
 - Duplicate file writes: Fixed by single consumer pattern
 - State not persisting: Check localStorage size limit (4MB)
 
