@@ -8,7 +8,11 @@
 
 (defonce worker-state
   (atom {:token nil
-         :index nil}))
+         :index nil
+         :pending-snapshot nil
+         :snapshot-scheduled? false}))
+
+(declare flush-snapshot!)
 
 (defn- post!
   [message]
@@ -45,10 +49,31 @@
            (assoc :bytes-total bytes-total))))
 
 (defn- post-snapshot!
-  [token index packet-msg window-size]
-  (post! {:type "snapshot"
-          :token token
-          :snapshot (replay-index/snapshot-at index packet-msg window-size)}))
+  [token index packet-msg window-size request-id]
+  (post! (cond-> {:type "snapshot"
+                  :token token
+                  :snapshot (replay-index/snapshot-at index packet-msg window-size)}
+           request-id
+           (assoc :request-id request-id))))
+
+(defn- schedule-snapshot!
+  []
+  (when-not (:snapshot-scheduled? @worker-state)
+    (swap! worker-state assoc :snapshot-scheduled? true)
+    (js/setTimeout flush-snapshot! 0)))
+
+(defn- flush-snapshot!
+  []
+  (let [{:keys [token index pending-snapshot]} @worker-state]
+    (swap! worker-state assoc
+           :pending-snapshot nil
+           :snapshot-scheduled? false)
+    (when-let [{request-token :token
+                :keys [packet-msg window-size request-id]} pending-snapshot]
+      (when (and (= token request-token)
+                 index
+                 (number? packet-msg))
+        (post-snapshot! token index packet-msg window-size request-id)))))
 
 (defn- complete-load!
   [token build bytes-loaded bytes-total]
@@ -57,7 +82,9 @@
         snapshot (when start-msg
                    (replay-index/snapshot-at index start-msg default-window-size))]
     (reset! worker-state {:token token
-                          :index index})
+                          :index index
+                          :pending-snapshot nil
+                          :snapshot-scheduled? false})
     (post! (cond-> {:type "complete"
                     :token token
                     :data (replay-index/summarize index)
@@ -138,12 +165,17 @@
           (.catch #(fail! token %))))))
 
 (defn- handle-snapshot!
-  [{:keys [token packet-msg window-size]}]
+  [{:keys [token packet-msg window-size request-id]}]
   (let [{active-token :token index :index} @worker-state]
     (when (and (= token active-token)
                index
                (number? packet-msg))
-      (post-snapshot! token index packet-msg (or window-size default-window-size)))))
+      (swap! worker-state assoc
+             :pending-snapshot {:token token
+                                :packet-msg packet-msg
+                                :window-size (or window-size default-window-size)
+                                :request-id request-id})
+      (schedule-snapshot!))))
 
 (defn- handle-message!
   [message]
@@ -156,7 +188,9 @@
 
     "dispose"
     (reset! worker-state {:token nil
-                          :index nil})
+                          :index nil
+                          :pending-snapshot nil
+                          :snapshot-scheduled? false})
 
     nil))
 

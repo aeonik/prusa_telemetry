@@ -16,7 +16,13 @@
 (def ^:private replay-worker-url "/js/replay-worker/main.js")
 (defonce ^:private replay-load-controller (atom nil))
 (defonce ^:private replay-worker-state (atom nil))
-(defonce ^:private replay-snapshot-request (atom nil))
+(defonce ^:private replay-snapshot-state
+  (atom {:next-id 0
+         :pending nil
+         :in-flight nil
+         :scheduled? false}))
+
+(declare flush-replay-snapshot-request!)
 
 (defn- active-load-token?
   [token]
@@ -42,7 +48,10 @@
     (.postMessage worker (clj->js {:type "dispose"}))
     (.terminate worker))
   (reset! replay-worker-state nil)
-  (reset! replay-snapshot-request nil))
+  (reset! replay-snapshot-state {:next-id 0
+                                 :pending nil
+                                 :in-flight nil
+                                 :scheduled? false}))
 
 (defn- replace-active-load! [token controller]
   (let [previous @replay-load-controller]
@@ -92,9 +101,15 @@
                   :bytes-total (:bytes-total message)}))
 
     "snapshot"
-    (dispatch! {:type :replay/snapshot-ready
-                :token token
-                :snapshot (:snapshot message)})
+    (do
+      (swap! replay-snapshot-state update :in-flight
+             (fn [in-flight]
+               (if (= (:request-id in-flight) (:request-id message))
+                 nil
+                 in-flight)))
+      (dispatch! {:type :replay/snapshot-ready
+                  :token token
+                  :snapshot (:snapshot message)}))
 
     "error"
     (do
@@ -147,16 +162,42 @@
    (request-replay-snapshot! packet-msg 120))
   ([packet-msg window-size]
    (when-let [{:keys [token worker]} @replay-worker-state]
-     (let [request-key [token packet-msg window-size]]
+     (let [request-key [token packet-msg window-size]
+           {:keys [pending in-flight]} @replay-snapshot-state]
        (when (and worker
                   (number? packet-msg)
-                  (not= request-key @replay-snapshot-request))
-         (reset! replay-snapshot-request request-key)
-         (.postMessage worker
-                       (clj->js {:type "snapshot"
-                                 :token token
-                                 :packet-msg packet-msg
-                                 :window-size window-size})))))))
+                  (not= request-key (:key pending))
+                  (not= request-key (:key in-flight)))
+         (let [request-id (:next-id (swap! replay-snapshot-state update :next-id inc))]
+           (swap! replay-snapshot-state assoc
+                  :pending {:key request-key
+                            :request-id request-id
+                            :token token
+                            :packet-msg packet-msg
+                            :window-size window-size})
+           (when-not (:scheduled? @replay-snapshot-state)
+             (swap! replay-snapshot-state assoc :scheduled? true)
+             (if (exists? js/requestAnimationFrame)
+               (js/requestAnimationFrame (fn [_] (flush-replay-snapshot-request!)))
+               (js/setTimeout flush-replay-snapshot-request! 16)))))))))
+
+(defn- flush-replay-snapshot-request!
+  []
+  (let [{:keys [token worker]} @replay-worker-state
+        {:keys [pending]} @replay-snapshot-state]
+    (swap! replay-snapshot-state assoc
+           :pending nil
+           :scheduled? false)
+    (when (and worker
+               pending
+               (= token (:token pending)))
+      (swap! replay-snapshot-state assoc :in-flight pending)
+      (.postMessage worker
+                    (clj->js {:type "snapshot"
+                              :token (:token pending)
+                              :request-id (:request-id pending)
+                              :packet-msg (:packet-msg pending)
+                              :window-size (:window-size pending)})))))
 
 (defn- stream-replay-response! [response archive token filename expected-bytes]
   (let [bytes-total (or (response-content-length response)

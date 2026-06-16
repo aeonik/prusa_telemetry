@@ -898,7 +898,8 @@
                      current-packet-msg
                      (not (snapshot-current? replay-snapshot current-packet-msg)))
             (files/request-replay-snapshot! current-packet-msg replay-spark-window))
-        snapshot-cards (snapshot-card-map active-snapshot)
+        display-snapshot (or active-snapshot replay-snapshot)
+        snapshot-cards (snapshot-card-map display-snapshot)
         packet (if (:worker-backed? replay-data)
                  (:packet active-snapshot)
                  (replay-packet-at replay-data current-packet-msg))
