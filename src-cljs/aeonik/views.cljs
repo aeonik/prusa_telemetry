@@ -335,6 +335,14 @@
     "--"
     (str (.toFixed value 1) "%")))
 
+(defn- format-bytes [value]
+  (if-not (number? value)
+    "--"
+    (let [mb (/ value 1048576)]
+      (if (>= mb 10)
+        (str (.toFixed mb 0) " MB")
+        (str (.toFixed mb 1) " MB")))))
+
 (defn- percent-width [value]
   (str (min 100 (max 0 (or value 0))) "%"))
 
@@ -799,14 +807,20 @@
     [:div {:class "replay-empty replay-error"} error]
 
     loading?
-    (let [{:keys [processed total]} load-progress
-          pct (if (and (pos? (or total 0)) (number? processed))
-                (* 100 (/ processed total))
-                0)]
+    (let [{:keys [processed total bytes-loaded bytes-total]} load-progress
+          packet-pct (when (and (pos? (or total 0)) (number? processed))
+                       (* 100 (/ processed total)))
+          byte-pct (when (and (pos? (or bytes-total 0)) (number? bytes-loaded))
+                     (* 100 (/ bytes-loaded bytes-total)))
+          pct (or packet-pct byte-pct 0)]
       [:div {:class "replay-empty replay-loading"}
        [:div {:class "replay-loading-body"}
         [:strong "Loading replay data"]
-        [:span (str (or processed 0) " / " (or total "--") " packets")]
+        [:span
+         (str (or processed 0) " / " (or total "--") " packets"
+              (when bytes-total
+                (str " · " (format-bytes bytes-loaded)
+                     " / " (format-bytes bytes-total))))]
         [:div {:class "print-progress-track"}
          [:div {:class "print-progress-fill"
                 :style {:width (percent-width pct)}}]]]])

@@ -173,6 +173,64 @@
                                              token)
                    0)))
 
+(defn- start-replay-stream-load
+  [state {:keys [archive token total bytes-total]}]
+  (reset! batch-processing-state
+          {:token token
+           :build (replay-index/empty-build archive total)})
+  (-> state
+      (assoc :telemetry-events [])
+      (assoc :selected-packet-msg nil)
+      (assoc :selected-filename nil)
+      (assoc :timeline-playing false)
+      (assoc-in [:replay :selected-run] archive)
+      (assoc-in [:replay :loading?] true)
+      (assoc-in [:replay :load-progress] {:processed 0
+                                           :total total
+                                           :bytes-loaded 0
+                                           :bytes-total bytes-total})
+      (assoc-in [:replay :data] nil)
+      (assoc-in [:replay :error] nil)))
+
+(defn- replay-stream-token-active?
+  [token]
+  (= token (:token @batch-processing-state)))
+
+(defn- progress-from-build
+  [build {:keys [bytes-loaded bytes-total]}]
+  (cond-> {:processed (:packet-count build)
+           :total (:total build)}
+    bytes-loaded
+    (assoc :bytes-loaded bytes-loaded)
+
+    bytes-total
+    (assoc :bytes-total bytes-total)))
+
+(defn- append-replay-stream-batch
+  [state {:keys [token packets] :as ev}]
+  (if (replay-stream-token-active? token)
+    (let [build (:build @batch-processing-state)
+          updated-build (reduce replay-index/add-packet build packets)]
+      (swap! batch-processing-state assoc :build updated-build)
+      (assoc-in state [:replay :load-progress] (progress-from-build updated-build ev)))
+    state))
+
+(defn- complete-replay-stream-load
+  [state {:keys [token]}]
+  (if (replay-stream-token-active? token)
+    (let [data (replay-index/finalize (:build @batch-processing-state))
+          start-msg (get-in data [:packet-range :min])]
+      (reset! batch-processing-state nil)
+      (-> state
+          (assoc :selected-packet-msg start-msg)
+          (assoc :selected-filename (:print-filename data))
+          (assoc :timeline-playing false)
+          (assoc-in [:replay :loading?] false)
+          (assoc-in [:replay :load-progress] nil)
+          (assoc-in [:replay :data] data)
+          (assoc-in [:replay :error] nil)))
+    state))
+
 (defn- handle-ws-message
   [state {:keys [sender metrics wall-time-str print-filename prelude received-at]}]
   (if (not (map? state))
@@ -365,22 +423,35 @@
         state))
 
     :replay/load-start
-    (-> state
-        (assoc :telemetry-events [])
-        (assoc :selected-packet-msg nil)
-        (assoc :selected-filename nil)
-        (assoc :timeline-playing false)
-        (assoc-in [:replay :selected-run] (:archive ev))
-        (assoc-in [:replay :loading?] true)
-        (assoc-in [:replay :load-progress] nil)
-        (assoc-in [:replay :data] nil)
-        (assoc-in [:replay :error] nil))
+    (do
+      (reset! batch-processing-state nil)
+      (-> state
+          (assoc :telemetry-events [])
+          (assoc :selected-packet-msg nil)
+          (assoc :selected-filename nil)
+          (assoc :timeline-playing false)
+          (assoc-in [:replay :selected-run] (:archive ev))
+          (assoc-in [:replay :loading?] true)
+          (assoc-in [:replay :load-progress] nil)
+          (assoc-in [:replay :data] nil)
+          (assoc-in [:replay :error] nil)))
 
     :replay/load-error
-    (-> state
-        (assoc-in [:replay :loading?] false)
-        (assoc-in [:replay :load-progress] nil)
-        (assoc-in [:replay :error] (:message ev)))
+    (do
+      (reset! batch-processing-state nil)
+      (-> state
+          (assoc-in [:replay :loading?] false)
+          (assoc-in [:replay :load-progress] nil)
+          (assoc-in [:replay :error] (:message ev))))
+
+    :replay/stream-start
+    (start-replay-stream-load state ev)
+
+    :replay/stream-batch
+    (append-replay-stream-batch state ev)
+
+    :replay/stream-complete
+    (complete-replay-stream-load state ev)
 
     :replay/select-run
     (assoc-in state [:replay :selected-run] (:archive ev))

@@ -115,6 +115,42 @@
        :headers {"Content-Type" "application/json"}
        :body (json/write-str {:error "Unable to load telemetry file"})})))
 
+(defn raw-telemetry-file-handler
+  "Stream a raw line-delimited EDN telemetry archive file."
+  [req]
+  (try
+    (let [uri (:uri req)
+          match (re-matches #"/api/telemetry-file-raw/([^/]+)/(.+)" uri)]
+      (if match
+        (let [[_ date filename] match
+              file-path (archive/archive-file (:prints-dir archive-state) date filename)]
+          (cond
+            (nil? file-path)
+            {:status 400
+             :headers {"Content-Type" "application/json"}
+             :body (json/write-str {:error "Invalid archive path"})}
+
+            (not (and (.exists file-path) (.isFile file-path)))
+            {:status 404
+             :headers {"Content-Type" "application/json"}
+             :body (json/write-str {:error "File not found"})}
+
+            :else
+            {:status 200
+             :headers {"Content-Type" "application/edn; charset=utf-8"
+                       "Content-Length" (str (.length file-path))
+                       "Cache-Control" "no-store"}
+             :body file-path}))
+        {:status 400
+         :headers {"Content-Type" "application/json"}
+         :body (json/write-str {:error "Invalid request format"})}))
+    (catch Exception e
+      (println "Error streaming telemetry file:" (.getMessage e))
+      (.printStackTrace e)
+      {:status 500
+       :headers {"Content-Type" "application/json"}
+       :body (json/write-str {:error "Unable to stream telemetry file"})})))
+
 (defn- setup-packet-saving-consumer
   "Set up a single consumer for saving packets (runs once per packet, not per WebSocket client).
    Creates subscription stream and connects to telemetry stream to ensure we see every packet.
@@ -254,6 +290,11 @@
             (println "Matched route:" uri)
             ((get routes uri) req))
           
+          (str/starts-with? uri "/api/telemetry-file-raw/")
+          (do
+            (println "Matched telemetry-file-raw pattern")
+            (raw-telemetry-file-handler req))
+
           ;; Check for telemetry file loading endpoint
           (str/starts-with? uri "/api/telemetry-file/")
           (do
