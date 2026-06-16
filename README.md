@@ -140,6 +140,24 @@ For REPL-driven development with hot reloading - **it just works!**
 - Use `(user/reload! {:restart-streams? true})` only after changing UDP socket
   setup, Manifold stream topology, or the telemetry stage graph.
 
+### FlowStorm Debugging
+
+Start the end-to-end Clojure/ClojureScript debugger flow with:
+
+```bash
+bin/dev-service debug
+```
+
+This starts the backend service, backend nREPL, shadow watch, shadow nREPL, and
+the FlowStorm GUI in the managed tmux session. Backend Clojure connects to the
+remote debugger automatically. Frontend ClojureScript connects from the browser
+through the debug preload, so refresh `http://localhost:9632` after starting
+debug mode.
+
+The debug service uses `flow-storm-shim.preload` instead of FlowStorm's stock
+preload because the current patched ClojureScript hook arity is newer than the
+published `flow-storm-dbg` runtime hook arity.
+
 **Stream Architecture**:
 - Telemetry server creates a `fan-out` stream (main distribution point)
 - Web server connects to `fan-out` stream for WebSocket clients and file saving
