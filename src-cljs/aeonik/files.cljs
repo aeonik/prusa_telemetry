@@ -13,7 +13,16 @@
 (def ^:private replay-parse-line-budget 25)
 (def ^:private replay-max-buffer-chars (* 1024 1024))
 (def ^:private replay-resume-buffer-chars (/ replay-max-buffer-chars 2))
+(def ^:private replay-worker-url "/js/replay-worker/main.js")
 (defonce ^:private replay-load-controller (atom nil))
+(defonce ^:private replay-worker-state (atom nil))
+(defonce ^:private replay-snapshot-state
+  (atom {:next-id 0
+         :pending nil
+         :in-flight nil
+         :scheduled? false}))
+
+(declare flush-replay-snapshot-request!)
 
 (defn- active-load-token?
   [token]
@@ -23,12 +32,33 @@
   (when (active-load-token? token)
     (reset! replay-load-controller nil)))
 
+(defn- stop-load-target! [target]
+  (cond
+    (and target (exists? (.-terminate target)))
+    (.terminate target)
+
+    (and target (exists? (.-abort target)))
+    (.abort target)
+
+    :else
+    nil))
+
+(defn- terminate-replay-worker! []
+  (when-let [worker (:worker @replay-worker-state)]
+    (.postMessage worker (clj->js {:type "dispose"}))
+    (.terminate worker))
+  (reset! replay-worker-state nil)
+  (reset! replay-snapshot-state {:next-id 0
+                                 :pending nil
+                                 :in-flight nil
+                                 :scheduled? false}))
+
 (defn- replace-active-load! [token controller]
   (let [previous @replay-load-controller]
     (reset! replay-load-controller {:token token
                                     :controller controller})
     (when-let [previous-controller (:controller previous)]
-      (.abort previous-controller))))
+      (stop-load-target! previous-controller))))
 
 (defn- response-content-length [response]
   (when-let [header (.get (.-headers response) "content-length")]
@@ -47,6 +77,127 @@
                 :packets packets
                 :bytes-loaded bytes-loaded
                 :bytes-total bytes-total})))
+
+(defn- worker-supported? []
+  (exists? js/Worker))
+
+(defn- handle-worker-message! [token message]
+  (case (:type message)
+    "progress"
+    (dispatch! {:type :replay/stream-progress
+                :token token
+                :processed (:processed message)
+                :bytes-loaded (:bytes-loaded message)
+                :bytes-total (:bytes-total message)})
+
+    "complete"
+    (do
+      (clear-active-load! token)
+      (dispatch! {:type :replay/index-ready
+                  :token token
+                  :data (:data message)
+                  :snapshot (:snapshot message)
+                  :bytes-loaded (:bytes-loaded message)
+                  :bytes-total (:bytes-total message)}))
+
+    "snapshot"
+    (do
+      (swap! replay-snapshot-state update :in-flight
+             (fn [in-flight]
+               (if (= (:request-id in-flight) (:request-id message))
+                 nil
+                 in-flight)))
+      (dispatch! {:type :replay/snapshot-ready
+                  :token token
+                  :snapshot (:snapshot message)}))
+
+    "error"
+    (do
+      (clear-active-load! token)
+      (terminate-replay-worker!)
+      (dispatch! {:type :replay/load-error
+                  :token token
+                  :message (:message message)}))
+
+    nil))
+
+(defn- start-replay-worker! [archive token url expected-bytes]
+  (when (worker-supported?)
+    (try
+      (terminate-replay-worker!)
+      (let [worker (js/Worker. replay-worker-url)]
+        (reset! replay-worker-state {:token token
+                                     :worker worker})
+        (replace-active-load! token worker)
+        (set! (.-onmessage worker)
+              (fn [event]
+                (handle-worker-message! token
+                                        (js->clj (.-data event)
+                                                 :keywordize-keys true))))
+        (set! (.-onerror worker)
+              (fn [error]
+                (js/console.error "Replay worker failed:" error)
+                (clear-active-load! token)
+                (terminate-replay-worker!)
+                (dispatch! {:type :replay/load-error
+                            :token token
+                            :message (or (.-message error)
+                                         "Replay worker failed")})))
+        (.postMessage worker
+                      (clj->js (cond-> {:type "load"
+                                         :archive archive
+                                         :token token
+                                         :url url}
+                                  expected-bytes
+                                  (assoc :expected-bytes expected-bytes))))
+        true)
+      (catch :default error
+        (js/console.warn "Replay worker unavailable, falling back to in-page streaming:" error)
+        (terminate-replay-worker!)
+        false))))
+
+(defn request-replay-snapshot!
+  "Ask the replay worker for the current scrub-position snapshot."
+  ([packet-msg]
+   (request-replay-snapshot! packet-msg 120))
+  ([packet-msg window-size]
+   (when-let [{:keys [token worker]} @replay-worker-state]
+     (let [request-key [token packet-msg window-size]
+           {:keys [pending in-flight]} @replay-snapshot-state]
+       (when (and worker
+                  (number? packet-msg)
+                  (not= request-key (:key pending))
+                  (not= request-key (:key in-flight)))
+         (let [request-id (:next-id (swap! replay-snapshot-state update :next-id inc))]
+           (swap! replay-snapshot-state assoc
+                  :pending {:key request-key
+                            :request-id request-id
+                            :token token
+                            :packet-msg packet-msg
+                            :window-size window-size})
+           (when-not (:scheduled? @replay-snapshot-state)
+             (swap! replay-snapshot-state assoc :scheduled? true)
+             (if (exists? js/requestAnimationFrame)
+               (js/requestAnimationFrame (fn [_] (flush-replay-snapshot-request!)))
+               (js/setTimeout flush-replay-snapshot-request! 16)))))))))
+
+(defn- flush-replay-snapshot-request!
+  []
+  (let [{:keys [token worker]} @replay-worker-state
+        {:keys [pending]} @replay-snapshot-state]
+    (swap! replay-snapshot-state assoc
+           :pending nil
+           :scheduled? false)
+    (when (and worker
+               pending
+               (= token (:token pending)))
+      (swap! replay-snapshot-state assoc :in-flight pending)
+      (.postMessage worker
+                    (clj->js {:type "snapshot"
+                              :token (:token pending)
+                              :request-id (:request-id pending)
+                              :packet-msg (:packet-msg pending)
+                              :window-size (:window-size pending)})))))
 
 (defn- stream-replay-response! [response archive token filename expected-bytes]
   (let [bytes-total (or (response-content-length response)
@@ -252,39 +403,41 @@
          archive (str date ":" filename)
          token (str archive ":" (.now js/Date))
          controller (js/AbortController.)]
-     (replace-active-load! token controller)
+     (terminate-replay-worker!)
      (dispatch! {:type :replay/load-start
                  :archive archive
                  :token token
                  :bytes-total expected-bytes})
-     (-> (js/fetch url #js {:signal (.-signal controller)})
-         (.then (fn [response]
-                  (if (.-ok response)
-                    (stream-replay-response! response archive token filename expected-bytes)
-                    (-> (.json response)
-                        (.then (fn [data]
-                                 (let [details (js->clj data :keywordize-keys true)]
-                                   (println "Replay file error details:" details)
+     (when-not (start-replay-worker! archive token url expected-bytes)
+       (replace-active-load! token controller)
+       (-> (js/fetch url #js {:signal (.-signal controller)})
+           (.then (fn [response]
+                    (if (.-ok response)
+                      (stream-replay-response! response archive token filename expected-bytes)
+                      (-> (.json response)
+                          (.then (fn [data]
+                                   (let [details (js->clj data :keywordize-keys true)]
+                                     (println "Replay file error details:" details)
+                                     (clear-active-load! token)
+                                     (dispatch! {:type :replay/load-error
+                                                :token token
+                                                :message (or (:error details)
+                                                             "Error loading telemetry replay file")}))
+                                   (js/Promise.resolve nil))
+                                 (fn [error]
+                                   (println "Error parsing replay error response:" error)
+                                   (js/console.error error)
                                    (clear-active-load! token)
                                    (dispatch! {:type :replay/load-error
                                               :token token
-                                              :message (or (:error details)
-                                                           "Error loading telemetry replay file")}))
-                                 (js/Promise.resolve nil))
-                               (fn [error]
-                                 (println "Error parsing replay error response:" error)
-                                 (js/console.error error)
-                                 (clear-active-load! token)
-                                 (dispatch! {:type :replay/load-error
-                                            :token token
-                                            :message (or (.-message error)
-                                                         "Error loading telemetry replay file")})
-                                 (js/Promise.resolve nil)))))))
-         (.catch (fn [error]
-                   (println "Error loading telemetry replay file:" error)
-                   (js/console.error error)
-                   (clear-active-load! token)
-                   (dispatch! {:type :replay/load-error
-                              :token token
-                              :message (or (.-message error)
-                                           "Error loading telemetry replay file")})))))))
+                                              :message (or (.-message error)
+                                                           "Error loading telemetry replay file")})
+                                   (js/Promise.resolve nil)))))))
+           (.catch (fn [error]
+                     (println "Error loading telemetry replay file:" error)
+                     (js/console.error error)
+                     (clear-active-load! token)
+                     (dispatch! {:type :replay/load-error
+                                :token token
+                                :message (or (.-message error)
+                                             "Error loading telemetry replay file")}))))))))

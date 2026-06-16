@@ -272,6 +272,7 @@
                               :device-time-str (:device-time-str m)}
                        (:value m) (assoc :value (:value m))
                        (:error m) (assoc :error (:error m))
+                       (:tags m) (assoc :tags (:tags m))
                        (:fields m) (assoc :fields (:fields m))))
                    sorted-metrics)
      :display-lines display-lines

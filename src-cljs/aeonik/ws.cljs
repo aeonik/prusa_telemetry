@@ -45,6 +45,7 @@
                         (doall (map (fn [m]
                                       {:name (aget m "name")
                                        :value (or (aget m "value") (aget m "error"))
+                                       :tags (js-fields->clj (aget m "tags"))
                                        :fields (js-fields->clj (aget m "fields"))
                                        :error (aget m "error")
                                        :type (aget m "type")

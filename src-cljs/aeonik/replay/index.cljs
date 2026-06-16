@@ -31,8 +31,8 @@
     build))
 
 (defn- metric-key
-  [sender metric-name]
-  [(or sender "") (or metric-name "")])
+  [sender metric-name tags]
+  [(or sender "") (or metric-name "") (te/tag-key tags)])
 
 (defn- empty-series
   [key sender metric-name metric-type print-filename]
@@ -43,40 +43,89 @@
    :print-filename print-filename
    :packet-msgs (array)
    :values (array)
+   :tags (array)
    :fields (array)
    :errors (array)
    :offset-us (array)
    :device-time-us (array)})
 
+(defn- typed-array?
+  [values]
+  (or (instance? js/Int32Array values)
+      (instance? js/Float64Array values)))
+
+(defn- column-count
+  [values]
+  (cond
+    (nil? values)
+    0
+
+    (or (array? values) (typed-array? values))
+    (alength values)
+
+    :else
+    (count values)))
+
+(defn- column-value
+  [values idx]
+  (when values
+    (if (or (array? values) (typed-array? values))
+      (aget values idx)
+      (get values idx))))
+
 (defn- sample-count
   [series]
-  (alength (:packet-msgs series)))
+  (column-count (:packet-msgs series)))
+
+(def ^:private max-summary-samples 2048)
+
+(defn- preview-indexes
+  [sample-total]
+  (if (<= sample-total max-summary-samples)
+    (range sample-total)
+    (let [last-idx (dec sample-total)
+          last-preview-idx (dec max-summary-samples)]
+      (map (fn [idx]
+             (js/Math.round (* idx (/ last-idx last-preview-idx))))
+           (range max-summary-samples)))))
+
+(defn- int-column
+  [source indexes]
+  (mapv #(or (aget source %) 0) indexes))
+
+(defn- number-column
+  [source indexes]
+  (mapv #(or (aget source %) js/NaN) indexes))
 
 (defn- sample-at-index
   [series idx]
   (when (and (number? idx)
              (<= 0 idx)
              (< idx (sample-count series)))
-    (cond-> {:packet-msg (aget (:packet-msgs series) idx)}
-      (some? (aget (:values series) idx))
-      (assoc :value (aget (:values series) idx))
+    (cond-> {:packet-msg (column-value (:packet-msgs series) idx)}
+      (some? (column-value (:values series) idx))
+      (assoc :value (column-value (:values series) idx))
 
-      (some? (aget (:fields series) idx))
-      (assoc :fields (aget (:fields series) idx))
+      (some? (column-value (:tags series) idx))
+      (assoc :tags (column-value (:tags series) idx))
 
-      (some? (aget (:errors series) idx))
-      (assoc :error (aget (:errors series) idx))
+      (some? (column-value (:fields series) idx))
+      (assoc :fields (column-value (:fields series) idx))
 
-      (some? (aget (:offset-us series) idx))
-      (assoc :offset-us (aget (:offset-us series) idx))
+      (some? (column-value (:errors series) idx))
+      (assoc :error (column-value (:errors series) idx))
 
-      (some? (aget (:device-time-us series) idx))
-      (assoc :device-time-us (aget (:device-time-us series) idx)))))
+      (some? (column-value (:offset-us series) idx))
+      (assoc :offset-us (column-value (:offset-us series) idx))
+
+      (some? (column-value (:device-time-us series) idx))
+      (assoc :device-time-us (column-value (:device-time-us series) idx)))))
 
 (defn- append-sample!
-  [series {:keys [packet-msg value fields error offset-us device-time-us]}]
+  [series {:keys [packet-msg value tags fields error offset-us device-time-us]}]
   (.push (:packet-msgs series) packet-msg)
   (.push (:values series) value)
+  (.push (:tags series) tags)
   (.push (:fields series) fields)
   (.push (:errors series) error)
   (.push (:offset-us series) offset-us)
@@ -136,8 +185,8 @@
       series)))
 
 (defn- add-sample
-  [build sender print-filename metric-name metric-type sample]
-  (let [key (metric-key sender metric-name)
+  [build sender print-filename metric-name metric-type tags sample]
+  (let [key (metric-key sender metric-name tags)
         existing-series (get-in build [:series key])
         new-series? (nil? existing-series)]
     (cond-> (assoc-in build [:series key]
@@ -173,11 +222,12 @@
                                                     {:name (str metric-name "." field-name)
                                                      :sample {:packet-msg packet-msg
                                                               :value numeric-value
+                                                              :tags (:tags metric)
                                                               :device-time-us (:device-time-us metric)}}))))
                                         vec)
                                    [])]
     (reduce (fn [acc {:keys [name sample]}]
-              (add-sample acc sender print-filename name "numeric" sample))
+              (add-sample acc sender print-filename name "numeric" (:tags sample) sample))
             (if (seq structured-field-samples)
               build
               (add-sample build
@@ -185,8 +235,10 @@
                           print-filename
                           metric-name
                           metric-type
+                          (:tags metric)
                           {:packet-msg packet-msg
                            :value (:value metric)
+                           :tags (:tags metric)
                            :fields (:fields metric)
                            :error (:error metric)
                            :offset-us (:offset-us metric)
@@ -251,6 +303,31 @@
    :metric-samples (:event-count index)
    :packet-metadata (count (:packets index))})
 
+(defn series-summary
+  "Return display-safe metadata for one replay metric series.
+   Numeric packet/value preview columns are retained so scrubbing
+   can update synchronously without keeping the full archive in app-state."
+  [series]
+  (let [series (finalize-series series)
+        indexes (preview-indexes (sample-count series))
+        summary (select-keys series
+                             [:key
+                              :sender
+                              :name
+                              :type
+                              :print-filename
+                              :numeric?
+                              :sample-count
+                              :event-count
+                              :stats
+                              :latest])]
+    (cond-> summary
+      (:numeric? series)
+      (assoc :packet-msgs (int-column (:packet-msgs series) indexes)
+             :values (number-column (:values series) indexes)
+             :preview? true
+             :preview-sample-count (count indexes)))))
+
 (defn finalize
   "Finalize an incremental replay index build for app-state."
   [build]
@@ -272,6 +349,15 @@
                :metric-cards cards}]
     (assoc index :memory-summary (memory-summary index))))
 
+(defn summarize
+  "Return a compact replay index summary suitable for app-state.
+   The full metric sample columns remain in the worker-owned index."
+  [index]
+  (-> index
+      (assoc :worker-backed? true)
+      (assoc :metric-cards (mapv series-summary (:metric-cards index)))
+      (dissoc :packets :packet-index)))
+
 (defn packet-at
   "Return packet metadata for packet-msg."
   [index packet-msg]
@@ -291,7 +377,7 @@
         (if (> lo hi)
           best
           (let [mid (js/Math.floor (/ (+ lo hi) 2))
-                sample-msg (aget packet-msgs mid)]
+                sample-msg (column-value packet-msgs mid)]
             (if (and (number? sample-msg) (<= sample-msg packet-msg))
               (recur (inc mid) hi mid)
               (recur lo (dec mid) best))))))))
@@ -327,7 +413,7 @@
             start (max 0 (- end limit))]
         (->> (range start end)
              (keep (fn [sample-idx]
-                     (let [value (aget values sample-idx)]
+                     (let [value (column-value values sample-idx)]
                        (when (te/finite-number? value)
                          value))))
              vec))
@@ -353,7 +439,7 @@
                      acc '()]
                 (if (and (number? idx)
                          (>= idx 0)
-                         (= packet-msg (aget packet-msgs idx)))
+                         (= packet-msg (column-value packet-msgs idx)))
                   (recur (dec idx)
                          (conj acc (sample->event series (sample-at-index series idx))))
                   acc)))))
@@ -362,3 +448,23 @@
                      (str (:name event))
                      (or (:device-time-us event) 0)]))
          vec)))
+
+(defn snapshot-at
+  "Return the packet-local replay data needed to render one scrub position."
+  ([index packet-msg]
+   (snapshot-at index packet-msg 120))
+  ([index packet-msg window-size]
+   (let [window-size (or window-size 120)]
+     {:packet-msg packet-msg
+      :packet (packet-at index packet-msg)
+      :metrics-at-packet (events-at-packet index packet-msg)
+      :cards (mapv (fn [series]
+                     (let [sample (sample-at-or-before series packet-msg)
+                           event (sample->event series sample)]
+                       (cond-> {:key (:key series)
+                                :selected-sample sample
+                                :selected-event event}
+                         (:numeric? series)
+                         (assoc :numeric-values
+                                (numeric-window-values-at series packet-msg window-size)))))
+                   (:metric-cards index))})))

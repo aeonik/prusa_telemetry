@@ -93,6 +93,7 @@
                                        (mapv (fn [m]
                                                {:name            (as-string (:name m))
                                                 :value           (:value m)
+                                                :tags            (:tags m)
                                                 :fields          (:fields m)
                                                 :error           (:error m)
                                                 :type            (:type m)

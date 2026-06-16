@@ -10,10 +10,40 @@
     (nil? metric-type) nil
     :else (str metric-type)))
 
+(declare field-entries)
+
+(defn tag-entries
+  "Return stable tag entries for display and metric identity."
+  [tags]
+  (let [tags (field-entries tags)]
+    (->> tags
+         (map (fn [[k v]]
+                [(if (keyword? k) (name k) (str k)) v]))
+         (sort-by first)
+         vec)))
+
+(defn tag-key
+  "Return a stable key fragment for metric tags."
+  [tags]
+  (pr-str (tag-entries tags)))
+
+(defn metric-display-name
+  "Return a metric name with a compact tag suffix for display."
+  [metric]
+  (let [entries (tag-entries (:tags metric))]
+    (if (seq entries)
+      (str (:name metric)
+           "["
+           (str/join "," (map (fn [[k v]] (str k "=" v)) entries))
+           "]")
+      (:name metric))))
+
 (defn metric-key
   "Return the stable identity for a metric event."
   [metric]
-  [(or (:sender metric) "") (or (:name metric) "")])
+  [(or (:sender metric) "")
+   (or (:name metric) "")
+   (tag-key (:tags metric))])
 
 (defn finite-number?
   "Return true when value is a finite JavaScript number."
@@ -55,6 +85,7 @@
   {:sender          sender
    :name            (:name metric)
    :value           (:value metric)
+   :tags            (:tags metric)
    :fields          (:fields metric)
    :error           (:error metric)
    :type            (metric-type-name (:type metric))

@@ -25,4 +25,14 @@
 
    :compiler-options
    {:optimizations :none
+    :source-map true}}
+
+  :replay-worker
+  {:target :browser
+   :output-dir "resources/js/replay-worker"
+   :asset-path "/js/replay-worker"
+   :modules {:main {:web-worker true
+                    :init-fn aeonik.replay.worker/init}}
+   :compiler-options
+   {:optimizations :none
     :source-map true}}}}

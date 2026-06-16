@@ -5,6 +5,7 @@
    [manifold.stream :as s]
    [manifold.deferred :as d]
    [aeonik.archive :as archive]
+   [aeonik.metric-catalog :as metric-catalog]
    [aeonik.prusa-telemetry :as telemetry]
    [aeonik.prusalink-proxy :as prusalink-proxy]
    [aeonik.prusalink-state :as prusalink-state]
@@ -78,6 +79,20 @@
       {:status 500
        :headers {"Content-Type" "application/json"}
        :body (json/write-str {:error "Unable to list telemetry files"})})))
+
+(defn metric-catalog-handler
+  "Return the firmware telemetry metric catalog."
+  [_req]
+  (try
+    {:status 200
+     :headers {"Content-Type" "application/json"
+               "Cache-Control" "no-cache"}
+     :body (json/write-str (metric-catalog/catalog))}
+    (catch Exception e
+      (println "Error loading metric catalog:" (.getMessage e))
+      {:status 500
+       :headers {"Content-Type" "application/json"}
+       :body (json/write-str {:error "Unable to load metric catalog"})})))
 
 (defn load-telemetry-file-handler
   "Load a telemetry data file by date and filename.
@@ -266,6 +281,7 @@
            ((ws-bridge/websocket-handler telemetry-stream
                                              {:prusalink-state prusalink-print-state})
             req))
+   "/api/metric-catalog" #'metric-catalog-handler
    "/api/telemetry-files" #'list-telemetry-files-handler
    "/api/prusalink/auth" #'prusalink-proxy/auth-status-handler
    "/api/prusalink/print-state" (fn [req]

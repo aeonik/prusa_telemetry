@@ -4,6 +4,7 @@
    This starts the same services exposed by dev/user.clj, but keeps them in a
    long-running process that is easy to supervise from tmux."
   (:require
+   [clojure.string :as str]
    [nrepl.server :as nrepl])
   (:gen-class))
 
@@ -40,6 +41,40 @@
   "Write the active backend nREPL port for editor attach workflows."
   [port]
   (spit ".nrepl-port" (str port "\n")))
+
+(defn- truey-config-value?
+  "Return true when a config value explicitly enables a boolean option."
+  [value]
+  (boolean
+   (when value
+     (not
+      (#{"0" "false" "no" "off" ""}
+       (str/lower-case (str/trim (str value))))))))
+
+(defn- flow-storm-remote-connect-enabled?
+  "Return true when backend FlowStorm remote connection is enabled."
+  []
+  (truey-config-value? (System/getenv "FLOW_STORM_REMOTE_CONNECT")))
+
+(defn- connect-flow-storm-remote!
+  "Connect the backend runtime to a running FlowStorm remote debugger."
+  []
+  (future
+    (loop [attempt 1]
+      (when (<= attempt 40)
+        (let [connected?
+              (try
+                ((requiring-resolve 'flow-storm.api/remote-connect) {})
+                true
+                (catch Throwable e
+                  (when (or (= attempt 1) (= attempt 40))
+                    (println "FlowStorm remote connect pending:" (.getMessage e)))
+                  false))]
+          (if connected?
+            (println "✓ Backend connected to FlowStorm remote debugger")
+            (do
+              (Thread/sleep 500)
+              (recur (inc attempt)))))))))
 
 (defn- stop-system!
   "Stop services and nREPL server tracked in state."
@@ -81,6 +116,8 @@
       (println (format "Backend nREPL: %s:%d" bind actual-nrepl-port))
       ((requiring-resolve 'user/start!) {:telemetry-port telemetry-port
                                          :web-port web-port})
+      (when (flow-storm-remote-connect-enabled?)
+        (connect-flow-storm-remote!))
       (println (format "Telemetry UDP: %d" telemetry-port))
       (println (format "Backend HTTP: http://localhost:%d" web-port))
       (println "Use (user/status), (user/restart!), and (user/stop!) from the backend REPL.")

@@ -3,25 +3,30 @@
 (defn format-metric-value [metric]
   (let [metric-type (:type metric)
         metric-value (:value metric)]
-    (case metric-type
-      "numeric" (if (number? metric-value)
-                  (if (integer? metric-value)
-                    (str metric-value)
-                    (.toFixed metric-value 3))
-                  (str metric-value))
-      "error" (str "ERROR: " (:error metric))
-      "structured" (let [fields (:fields metric)]
-                     (cond
-                       (nil? fields) ""
-                       (map? fields)
-                       (str "{" (apply str (interpose ", " (map (fn [[k v]] (str k ": " v)) fields))) "}")
-                       ;; Handle JavaScript objects
-                       (and (object? fields) (not (array? fields)))
-                       (let [keys (js/Object.keys fields)]
-                         (str "{" (apply str (interpose ", " (map (fn [k] (str k ": " (aget fields k))) keys))) "}"))
-                       (array? fields)
-                       (str "[" (apply str (interpose ", " fields)) "]")
-                       :else (str fields)))
+    (cond
+      (= metric-type "error")
+      (str "ERROR: " (:error metric))
+
+      (= metric-type "structured")
+      (let [fields (:fields metric)]
+        (cond
+          (nil? fields) ""
+          (map? fields)
+          (str "{" (apply str (interpose ", " (map (fn [[k v]] (str k ": " v)) fields))) "}")
+          ;; Handle JavaScript objects
+          (and (object? fields) (not (array? fields)))
+          (let [keys (js/Object.keys fields)]
+            (str "{" (apply str (interpose ", " (map (fn [k] (str k ": " (aget fields k))) keys))) "}"))
+          (array? fields)
+          (str "[" (apply str (interpose ", " fields)) "]")
+          :else (str fields)))
+
+      (number? metric-value)
+      (if (integer? metric-value)
+        (str metric-value)
+        (.toFixed metric-value 3))
+
+      :else
       (str metric-value))))
 
 (defn pad-number

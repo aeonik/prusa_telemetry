@@ -3,7 +3,9 @@
    [aleph.udp :as udp]
    [aleph.tcp :as tcp]
    [clj-commons.byte-streams :as bs]
+   [clojure.edn :as edn]
    [clojure.string :as str]
+   [aeonik.metric-catalog :as metric-catalog]
    [manifold.stream :as s]
    [manifold.bus :as bus])
   (:import [java.text SimpleDateFormat]))
@@ -19,23 +21,76 @@
   (try (Double/parseDouble s) (catch Exception _ nil)))
 
 (defn unquote-str [s]
-  (if (and (string? s) (>= (count s) 2) (= \" (first s)) (= \" (last s)))
-    (subs s 1 (dec (count s)))
+  (cond
+    (and (string? s) (>= (count s) 2) (= \" (first s)) (= \" (last s)))
+    (try
+      (edn/read-string s)
+      (catch Exception _
+        (subs s 1 (dec (count s)))))
+
+    (and (string? s) (seq s) (= \" (first s)))
+    (subs s 1)
+
+    :else
     s))
 
 (defn parse-value [s]
   (when s
     (let [s (str/trim s)]
-      (if (and (>= (count s) 2) (str/ends-with? s "i"))
+      (cond
+        (and (>= (count s) 2) (str/ends-with? s "i"))
         (or (parse-long? (subs s 0 (dec (count s)))) (unquote-str s))
+
+        (re-matches #"[+-]?\d+" s)
+        (or (parse-long? s) (unquote-str s))
+
+        :else
         (or (parse-double? s) (unquote-str s))))))
+
+(defn split-unquoted
+  "Split s on delimiter outside double-quoted strings."
+  [s delimiter]
+  (let [s (or s "")
+        length (count s)]
+    (loop [idx 0
+           in-quote? false
+           escaped? false
+           part (StringBuilder.)
+           parts []]
+      (if (>= idx length)
+        (conj parts (str part))
+        (let [ch (.charAt s idx)]
+          (cond
+            escaped?
+            (do
+              (.append part ch)
+              (recur (inc idx) in-quote? false part parts))
+
+            (= ch \\)
+            (do
+              (.append part ch)
+              (recur (inc idx) in-quote? true part parts))
+
+            (= ch \")
+            (do
+              (.append part ch)
+              (recur (inc idx) (not in-quote?) false part parts))
+
+            (and (= ch delimiter) (not in-quote?))
+            (recur (inc idx) false false (StringBuilder.) (conj parts (str part)))
+
+            :else
+            (do
+              (.append part ch)
+              (recur (inc idx) in-quote? false part parts))))))))
 
 (defn parse-kv-pairs [s]
   (into {}
         (keep (fn [seg]
-                (let [[k v] (str/split seg #"=" 2)]
-                  (when (and (seq k) (some? v)) [k (parse-value v)]))))
-        (str/split (or s "") #",")))
+                (let [[k v] (str/split (str/trim seg) #"=" 2)]
+                  (when (and (seq k) (some? v))
+                    [k (parse-value v)]))))
+        (split-unquoted (or s "") \,)))
 
 (def prelude-re #"(?:^|\s)msg=\d+,\s*tm=\d+,\s*v=\d+")
 
@@ -59,45 +114,118 @@
                  :offset-ms (when offset-us (/ offset-us 1000.0)))
     (and offset-us base-tm-us) (assoc :device-time-us (+ base-tm-us offset-us))))
 
-(defn parse-metric-line [line base-tm-us]
-  (let [line (str/trim line)]
+(defn parse-metric-head
+  "Parse a line-protocol metric head into a clean metric name and tag map."
+  [head]
+  (let [[name & tag-parts] (split-unquoted head \,)]
+    {:name (not-empty (str/trim (or name "")))
+     :tags (not-empty
+            (into {}
+                  (keep (fn [tag-part]
+                          (let [[k v] (str/split (str/trim tag-part) #"=" 2)]
+                            (when (and (seq k) (some? v))
+                              [k (parse-value v)]))))
+                  tag-parts))}))
+
+(defn- parse-scalar-value
+  [raw-value scalar-type]
+  (case scalar-type
+    :integer (or (parse-long? (str/replace (str/trim raw-value) #"i$" ""))
+                 (parse-value raw-value))
+    :float (or (parse-double? (str/trim raw-value))
+               (parse-value raw-value))
+    :string (unquote-str (str/trim raw-value))
+    :event true
+    (parse-value raw-value)))
+
+(defn- scalar-line?
+  [tags fields]
+  (and (empty? tags)
+       (= #{"v"} (set (keys fields)))))
+
+(defn- inferred-scalar-type
+  [value]
+  (if (number? value) :numeric :string))
+
+(defn- metric-line-body
+  [line]
+  (when-let [[_ body raw-offset] (re-matches #"(?s)^(.+)\s+(-?\d+)\s*$" line)]
+    {:body body
+     :offset-us (parse-long? raw-offset)}))
+
+(defn parse-metric-line
+  ([line base-tm-us]
+   (parse-metric-line line base-tm-us nil))
+  ([line base-tm-us catalog]
+   (let [line (str/trim line)]
     (when (seq line)
-      (if-let [[_ name raw-value raw-offset] (re-matches #"^(\S+)\s+v=(.+)\s+(-?\d+)\s*$" line)]
-        (let [offset-us (parse-long? raw-offset)]
-          (add-timing-fields
-           {:type :numeric, :name name, :value (parse-value raw-value)}
-           offset-us
-           base-tm-us))
-        (let [tokens (str/split line #"\s+")
-              name (first tokens)
-              ntoken (count tokens)
-              second-tok (second tokens)
-              offset-us (parse-long? (last tokens))]
+      (if-let [{:keys [body offset-us]} (metric-line-body line)]
+        (let [[head fields-str] (str/split body #"\s+" 2)
+              {:keys [name tags]} (parse-metric-head head)
+              fields (parse-kv-pairs fields-str)
+              metric-def (if catalog
+                           (metric-catalog/metric-definition catalog name)
+                           (metric-catalog/metric-definition name))
+              scalar-type (metric-catalog/scalar-metric-type metric-def)]
           (cond
-            (and (>= ntoken 3) (str/starts-with? (or second-tok "") "error="))
+            (contains? fields "error")
             (add-timing-fields
-             {:type :error, :name name,
-              :error (or (second (re-find #"error=\"([^\"]*)\"" line)) "")}
+             {:type :error
+              :name name
+              :error (str (get fields "error"))}
              offset-us
              base-tm-us)
 
-            (>= ntoken 3)
+            (scalar-line? tags fields)
+            (let [value (parse-scalar-value (str (get fields "v"))
+                                            scalar-type)
+                  inferred-type (or scalar-type (inferred-scalar-type value))]
+              (add-timing-fields
+               {:type inferred-type
+                :name name
+                :value value}
+               offset-us
+               base-tm-us))
+
+            (seq fields)
             (add-timing-fields
-             {:type :structured, :name name,
-              :fields (parse-kv-pairs (str/join " " (drop 1 (drop-last 1 tokens))))}
+             (cond-> {:type :structured
+                      :name name
+                      :fields fields}
+               (seq tags) (assoc :tags tags))
              offset-us
              base-tm-us)
 
-            :else {:type :unknown, :name name, :raw line}))))))
+            :else
+            {:type :unknown
+             :name name
+             :raw line}))
+        {:type :unknown
+         :name (first (str/split line #"\s+"))
+         :raw line})))))
+
+(defn- parse-prelude-line
+  [line]
+  (let [matcher (re-matcher prelude-re (or line ""))]
+    (when (.find matcher)
+      {:prelude (parse-prelude (str/trim (.group matcher)))
+       :metric-tail (str/trim (subs line (.end matcher)))})))
 
 (defn parse-packet [{:keys [message sender]}]
   (try
     (let [txt        (bs/to-string message)
           lines      (str/split txt #"\r?\n")
-          prelude    (parse-prelude (some-> (re-find prelude-re (first lines)) str/trim))
-          base-tm-us (:base-time-us prelude)]
+          parsed-head (parse-prelude-line (first lines))
+          prelude    (or (:prelude parsed-head) {})
+          base-tm-us (:base-time-us prelude)
+          metric-lines (if parsed-head
+                         (into (if (seq (:metric-tail parsed-head))
+                                 [(:metric-tail parsed-head)]
+                                 [])
+                               (rest lines))
+                         lines)]
       {:sender sender, :received-at (java.util.Date.), :prelude prelude,
-       :metrics (into [] (keep #(parse-metric-line % base-tm-us)) (rest lines)),
+       :metrics (into [] (keep #(parse-metric-line % base-tm-us)) metric-lines),
        :raw txt})
     (catch Exception e
       {:error (.getMessage e), :raw (try (bs/to-string message) (catch Exception _ "<?>"))})))
@@ -126,14 +254,20 @@
                         ms))))))
 
 (defn format-value [m]
-  (case (:type m)
-    :numeric    (let [v (:value m)]
-                  (cond (integer? v) (str v)
-                        (number? v)  (format "%.3f" (double v))
-                        :else        (str v)))
-    :error      (str "ERROR: " (:error m))
-    :structured (str/join ", " (map (fn [[k v]] (str k "=" v)) (:fields m)))
-    "?"))
+  (cond
+    (:error m)
+    (str "ERROR: " (:error m))
+
+    (:fields m)
+    (str/join ", " (map (fn [[k v]] (str k "=" v)) (:fields m)))
+
+    :else
+    (let [v (:value m)]
+      (cond
+        (integer? v) (str v)
+        (number? v)  (format "%.3f" (double v))
+        (some? v)    (str v)
+        :else        "?"))))
 
 (defn add-display-lines [{:keys [wall-time-str metrics] :as packet}]
   (assoc packet :display-lines
