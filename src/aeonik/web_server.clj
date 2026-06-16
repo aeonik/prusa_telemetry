@@ -4,359 +4,19 @@
    [aleph.netty :as netty]
    [manifold.stream :as s]
    [manifold.deferred :as d]
+   [aeonik.archive :as archive]
    [aeonik.prusa-telemetry :as telemetry]
-   [aeonik.prusalink :as prusalink]
-   [aeonik.prusalink-auth :as prusalink-auth]
+   [aeonik.prusalink-proxy :as prusalink-proxy]
+   [aeonik.prusalink-state :as prusalink-state]
    [clojure.data.json :as json]
-   [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]))
 
-(def ^:private prints-dir (io/file "telemetry-data" "prints"))
-(def ^:private prusalink-request-error "PrusaLink request failed")
-
-;; Track active prints per sender:
-;; {sender {:filename "..." :save-filename "..." :job-id 123 :last-packet-time <timestamp>}}
-(def ^:private active-prints (atom {}))
 (def ^:private prusalink-print-state
-  (atom {:available? false
-         :active? nil
-         :run-id nil
-         :updated-at nil}))
+  (atom prusalink-state/initial-state))
 
-;; Print is considered ended if no packets received for this many milliseconds
-(def ^:private print-end-timeout-ms (* 10 60 1000)) ; 10 minutes
-(def ^:private missing-print-filename ::missing-print-filename)
-(def ^:private prusalink-poll-interval-ms 1000)
-
-(defn- ensure-prints-dir!
-  "Ensure the prints directory exists"
-  []
-  (when-not (.exists prints-dir)
-    (.mkdirs prints-dir)
-    (println "Created prints directory:" (.getAbsolutePath prints-dir))))
-
-(defn- child-path?
-  "Return true when child resolves inside base after canonicalization."
-  [base child]
-  (let [base-path (.getCanonicalPath base)
-        child-path (.getCanonicalPath child)
-        base-prefix (str base-path java.io.File/separator)]
-    (or (= child-path base-path)
-        (str/starts-with? child-path base-prefix))))
-
-(defn- valid-archive-date?
-  "Return true when date is a telemetry archive date directory."
-  [date]
-  (boolean (re-matches #"\d{4}-\d{2}-\d{2}" (or date ""))))
-
-(defn- valid-archive-filename?
-  "Return true when filename is a single EDN archive filename."
-  [filename]
-  (and (string? filename)
-       (str/ends-with? filename ".edn")
-       (not (str/blank? filename))
-       (not (str/includes? filename "/"))
-       (not (str/includes? filename "\\"))))
-
-(defn- archive-file
-  "Return a canonicalized archive file when date and filename are safe."
-  [date filename]
-  (when (and (valid-archive-date? date)
-             (valid-archive-filename? filename))
-    (let [file (io/file prints-dir date filename)]
-      (when (child-path? prints-dir file)
-        file))))
-
-(defn- normalize-print-filename
-  "Normalize the firmware print filename metric.
-   Blank names mean idle/no active print. Some long string metrics can arrive
-   with an opening quote but no closing quote, so trim boundary quotes here."
-  [filename]
-  (when (some? filename)
-    (let [normalized (-> (str filename)
-                         (str/trim)
-                         (str/replace #"^\"+" "")
-                         (str/replace #"\"+$" "")
-                         (str/trim))]
-      (not-empty normalized))))
-
-(defn- sanitize-filename
-  "Sanitize filename for use in file system."
-  [filename]
-  (when-let [filename (normalize-print-filename filename)]
-    (not-empty
-     (-> filename
-         (str/replace #"[^\w\s\-_\.]" "_")
-         (str/replace #"\s+" "_")
-         (str/replace #"^\.+" "")
-         (str/replace #"\.+$" "")
-         (str/trim)))))
-
-(defn- archive-file-for-save!
-  "Return the archive file for a print filename and create its date directory."
-  [print-filename]
-  (when-let [sanitized-name (sanitize-filename print-filename)]
-    (let [now (java.util.Date.)
-          date-fmt (java.text.SimpleDateFormat. "yyyy-MM-dd")
-          date-str (.format date-fmt now)
-          filename (str sanitized-name ".edn")
-          file (archive-file date-str filename)]
-      (when file
-        (.mkdirs (.getParentFile file))
-        file))))
-
-(defn- metric-value
-  "Extract a metric value from either :value or structured fields."
-  [metric]
-  (or (:value metric)
-      (when-let [fields (:fields metric)]
-        (when (map? fields)
-          (or (get fields "value")
-              (first (vals fields)))))))
-
-(defn- get-print-filename
-  "Extract raw print_filename from metrics.
-   Returns `missing-print-filename` when the metric is absent so an explicit
-   blank filename can be distinguished from no filename update."
-  [metrics]
-  (reduce (fn [_ metric]
-            (if (= (:name metric) "print_filename")
-              (reduced (metric-value metric))
-              missing-print-filename))
-          missing-print-filename
-          metrics))
-
-(defn- active-prusalink-run-suffix
-  "Return the active local print-run suffix when PrusaLink reports a live job."
-  []
-  (let [{:keys [available? active? run-id job-id]} @prusalink-print-state]
-    (when (and available? active?)
-      (or run-id
-          (when (some? job-id) (str "job-" job-id))))))
-
-(defn- print-save-filename
-  "Build the archive filename for a print run.
-   A local run suffix distinguishes repeated attempts of the same G-code file."
-  [filename]
-  (when-let [filename (normalize-print-filename filename)]
-    (if-let [run-suffix (active-prusalink-run-suffix)]
-      (str filename "_" run-suffix)
-      filename)))
-
-(defn- get-active-print
-  "Get the active print for a sender, checking for timeouts."
-  [sender current-time]
-  (let [active-print (get @active-prints sender)]
-    (if active-print
-      (let [time-since-last-packet (- current-time (:last-packet-time active-print))]
-        (if (> time-since-last-packet print-end-timeout-ms)
-          ;; Print has timed out - consider it ended
-          (do
-            (swap! active-prints dissoc sender)
-            nil)
-          ;; Still active - update last packet time
-          (do
-            (swap! active-prints assoc sender (assoc active-print :last-packet-time current-time))
-            (get @active-prints sender))))
-      nil)))
-
-(defn- set-active-print-filename! 
-  "Set the active print filename for a sender."
-  [sender filename current-time]
-  (let [save-filename (print-save-filename filename)]
-    (swap! active-prints assoc sender
-           {:filename filename
-            :save-filename save-filename
-            :run-suffix (active-prusalink-run-suffix)
-            :last-packet-time current-time})
-    (get @active-prints sender)))
-
-(defn- refresh-active-print-run!
-  "Update the active save filename when PrusaLink reports a new local run."
-  [sender active-print current-time]
-  (if (and active-print (active-prusalink-run-suffix))
-    (let [expected-save-filename (print-save-filename (:filename active-print))]
-      (if (= expected-save-filename (:save-filename active-print))
-        active-print
-        (set-active-print-filename! sender (:filename active-print) current-time)))
-    active-print))
-
-(defn- clear-active-print-filename!
-  "Clear the active print filename for a sender."
-  [sender]
-  (swap! active-prints dissoc sender))
-
-(defn- prusalink-print-active?
-  "Return true when PrusaLink currently reports an active job.
-   If PrusaLink is unavailable, preserve telemetry-only save behavior."
-  []
-  (let [{:keys [available? active?]} @prusalink-print-state]
-    (if available?
-      (boolean active?)
-      true)))
-
-(defn- clear-completed-print!
-  "Clear sticky print tracking when PrusaLink says the print is no longer active."
-  [sender active-print]
-  (when active-print
-    (println "PrusaLink reports no active job; stopping telemetry save for"
-             (or (:save-filename active-print) (:filename active-print))))
-  (clear-active-print-filename! sender))
-
-(defn- new-prusalink-run-id
-  "Create a local print-run identifier from the observed PrusaLink job."
-  [job-id now-ms]
-  (let [stamp (.format (java.text.SimpleDateFormat. "yyyyMMdd-HHmmss-SSS")
-                       (java.util.Date. now-ms))]
-    (if (some? job-id)
-      (str "job-" job-id "_run-" stamp)
-      (str "run-" stamp))))
-
-(defn- prusalink-run-started?
-  "Return true when status indicates a new local print run.
-   PrusaLink job ids can be reused when manually reprinting, so also detect
-   elapsed-time or progress rollbacks."
-  [previous-state job]
-  (let [previous-time (:time-printing previous-state)
-        current-time (:time_printing job)
-        previous-progress (:progress previous-state)
-        current-progress (:progress job)]
-    (or (not (:active? previous-state))
-        (not= (:job-id previous-state) (:id job))
-        (and (number? previous-time)
-             (number? current-time)
-             (< current-time (- previous-time 5)))
-        (and (number? previous-progress)
-             (number? current-progress)
-             (< current-progress (- previous-progress 1.0))))))
-
-(defn- prusalink-status->print-state
-  "Convert a PrusaLink status JSON map into local print-state."
-  ([status-json]
-   (prusalink-status->print-state status-json @prusalink-print-state (System/currentTimeMillis)))
-  ([{:keys [printer job]} previous-state now-ms]
-   (let [active? (boolean job)
-         run-id (when active?
-                  (if (prusalink-run-started? previous-state job)
-                    (new-prusalink-run-id (:id job) now-ms)
-                    (:run-id previous-state)))]
-     {:available? true
-      :active? active?
-      :state (:state printer)
-      :job-id (:id job)
-      :run-id run-id
-      :progress (:progress job)
-      :time-printing (:time_printing job)
-      :updated-at now-ms})))
-
-(defn- refresh-prusalink-print-state!
-  "Poll PrusaLink for the current print state used to gate disk writes."
-  []
-  (try
-    (let [{:keys [status json]} (prusalink/status)]
-      (if (<= 200 status 299)
-        (reset! prusalink-print-state (prusalink-status->print-state json))
-        (swap! prusalink-print-state assoc
-               :available? false
-               :active? nil
-               :error (str "HTTP " status)
-               :updated-at (System/currentTimeMillis))))
-    (catch Exception e
-      (println "PrusaLink print-state poll failed:" (.getMessage e))
-      (swap! prusalink-print-state assoc
-             :available? false
-             :active? nil
-             :error prusalink-request-error
-             :updated-at (System/currentTimeMillis)))))
-
-(defn- start-prusalink-print-state-poller!
-  "Start polling PrusaLink print state.
-   Returns a stop function."
-  []
-  (let [running? (atom true)
-        poller (future
-                 (while @running?
-                   (refresh-prusalink-print-state!)
-                   (Thread/sleep prusalink-poll-interval-ms)))]
-    (fn []
-      (reset! running? false)
-      (future-cancel poller))))
-
-(defn- save-packet-to-file!
-  "Save a packet to a file for the given print filename in EDN format (append-only, one packet per line)"
-  [packet print-filename]
-  (try
-    (ensure-prints-dir!)
-    (if-let [print-file (archive-file-for-save! print-filename)]
-      (do
-        (with-open [writer (io/writer print-file :append true)]
-          (binding [*print-length* nil
-                    *print-level* nil
-                    *out* writer]
-            (prn packet)))
-        true)
-      false)
-    (catch Exception e
-      (println "Error saving packet to file:" (.getMessage e))
-      (.printStackTrace e)
-      false)))
-
-(defn telemetry-to-json
-  "Convert telemetry packet to JSON-serializable format, ensuring metrics are sorted by device-time-us"
-  [{:keys [sender received-at prelude metrics display-lines wall-time-str]}]
-  (let [sorted-metrics (sort-by (fn [m] (or (:device-time-us m) 0)) metrics)]
-    {:sender (str sender)
-     :received-at (.getTime received-at)
-     :prelude prelude
-     :metrics (map (fn [m]
-                     (cond-> {:name (:name m)
-                              :type (name (:type m))
-                              :offset-us (:offset-us m)
-                              :offset-ms (:offset-ms m)
-                              :device-time-us (:device-time-us m)
-                              :device-time-str (:device-time-str m)}
-                       (:value m) (assoc :value (:value m))
-                       (:error m) (assoc :error (:error m))
-                       (:fields m) (assoc :fields (:fields m))))
-                   sorted-metrics)
-     :display-lines display-lines
-     :wall-time-str wall-time-str}))
-
-(defn- handle-packet-saving! 
-  "Handle print filename tracking and file saving (called once per packet, not per WebSocket client)"
-  [packet]
-  (let [{:keys [sender metrics]} packet
-        sender-str (str sender)
-        current-time (System/currentTimeMillis)
-        ;; Check for new print_filename in this packet
-        raw-print-filename (get-print-filename metrics)
-        saw-print-filename? (not= missing-print-filename raw-print-filename)
-        new-print-filename (when saw-print-filename?
-                             (normalize-print-filename raw-print-filename))
-        ;; Get active print (handles sticky behavior, timeout, and PrusaLink run ids)
-        active-print (refresh-active-print-run!
-                      sender-str
-                      (get-active-print sender-str current-time)
-                      current-time)
-        active-save-filename (:save-filename active-print)]
-    (cond
-      (not (prusalink-print-active?))
-      (clear-completed-print! sender-str active-print)
-
-      ;; Firmware emits a blank print_filename while idle. Treat that as an
-      ;; explicit end marker so post-print telemetry does not append forever.
-      (and saw-print-filename? (nil? new-print-filename))
-      (clear-active-print-filename! sender-str)
-
-      new-print-filename
-      (let [new-save-filename (print-save-filename new-print-filename)]
-        (when-not (= new-save-filename active-save-filename)
-          (set-active-print-filename! sender-str new-print-filename current-time))
-        (save-packet-to-file! (telemetry-to-json packet) new-save-filename))
-
-      active-save-filename
-      (save-packet-to-file! (telemetry-to-json packet) active-save-filename))))
+(def ^:private archive-state
+  (archive/make-state {:prusalink-state prusalink-print-state}))
 
 (defn websocket-handler
   "WebSocket handler that streams telemetry data.
@@ -377,7 +37,7 @@
                    (s/consume
                     (fn [packet]
                       (try
-                        (let [json-data (json/write-str (telemetry-to-json packet))
+                        (let [json-data (json/write-str (archive/telemetry-to-json packet))
                               put-result (s/put! ws json-data)]
                           (when put-result
                             (d/on-realized put-result
@@ -453,28 +113,9 @@
   "List all available telemetry data files"
   [_req]
   (try
-    (ensure-prints-dir!)
-    (let [date-dirs (filter #(and (.isDirectory %)
-                                  (re-matches #"\d{4}-\d{2}-\d{2}" (.getName %)))
-                            (or (.listFiles prints-dir) []))
-          files-by-date (reduce (fn [acc date-dir]
-                                 (let [date (.getName date-dir)
-                                       edn-files (filter #(and (.isFile %)
-                                                               (str/ends-with? (.getName %) ".edn"))
-                                                        (or (.listFiles date-dir) []))
-                                       file-info (map (fn [f]
-                                                       {:date date
-                                                        :filename (.getName f)
-                                                        :size (.length f)
-                                                        :modified (.lastModified f)})
-                                                     edn-files)]
-                                   (concat acc file-info)))
-                               []
-                               date-dirs)
-          sorted-files (sort-by (fn [f] [(:date f) (:filename f)]) files-by-date)]
-      {:status 200
-       :headers {"Content-Type" "application/json"}
-       :body (json/write-str sorted-files)})
+    {:status 200
+     :headers {"Content-Type" "application/json"}
+     :body (json/write-str (archive/list-telemetry-files! archive-state))}
     (catch Exception e
       (println "Error listing telemetry files:" (.getMessage e))
       (.printStackTrace e)
@@ -492,28 +133,19 @@
           match (re-matches #"/api/telemetry-file/([^/]+)/(.+)" uri)]
       (if match
         (let [[_ date filename] match
-              file-path (archive-file date filename)]
-          (cond
-            (nil? file-path)
+              result (archive/read-telemetry-file archive-state date filename)]
+          (case (:status result)
+            :invalid-path
             {:status 400
              :headers {"Content-Type" "application/json"}
              :body (json/write-str {:error "Invalid archive path"})}
 
-            (and (.exists file-path) (.isFile file-path))
-            ;; Read packets line by line - they're already in correct format
-            (let [packets (with-open [reader (io/reader file-path)]
-                            (doall (keep (fn [line]
-                                           (try
-                                             (edn/read-string line)
-                                             (catch Exception e
-                                               (println "Error reading line:" (.getMessage e))
-                                               nil)))
-                                         (line-seq reader))))]
-              {:status 200
-               :headers {"Content-Type" "application/json"}
-               :body (json/write-str packets)})
+            :ok
+            {:status 200
+             :headers {"Content-Type" "application/json"}
+             :body (json/write-str (:packets result))}
 
-            :else
+            :not-found
             {:status 404
              :headers {"Content-Type" "application/json"}
              :body (json/write-str {:error "File not found"})}))
@@ -538,7 +170,7 @@
     (let [saving-consumer (s/consume 
                            (fn [packet]
                              (try
-                               (handle-packet-saving! packet)
+                               (archive/handle-packet-saving! archive-state packet)
                                (catch Exception e
                                  (println "ERROR processing packet for saving:" (.getMessage e))
                                  (.printStackTrace e)))
@@ -573,70 +205,6 @@
     {:status 404
      :headers {"Content-Type" "text/plain"}
      :body "dashboard.html not found"}))
-
-(defn- prusalink-auth-status-handler
-  "Return a password-safe status for the local PrusaLink auth config."
-  [_req]
-  {:status 200
-   :headers {"Content-Type" "application/json"}
-   :body (json/write-str (prusalink-auth/auth-status))})
-
-(defn- prusalink-print-state-handler
-  "Return the backend's local PrusaLink-derived print/run state."
-  [_req]
-  {:status 200
-   :headers {"Content-Type" "application/json"
-             "Cache-Control" "no-cache"}
-   :body (json/write-str @prusalink-print-state)})
-
-(defn- prusalink-proxy-handler
-  "Proxy a PrusaLink API request through the backend Digest-auth client."
-  [target-path]
-  (fn [_req]
-    (try
-      (let [{:keys [status body]} (prusalink/request target-path)]
-        {:status status
-         :headers {"Content-Type" "application/json"
-                   "Cache-Control" "no-cache"}
-         :body body})
-      (catch Exception e
-        (println "PrusaLink proxy request failed:" (.getMessage e))
-        {:status 502
-         :headers {"Content-Type" "application/json"
-                   "Cache-Control" "no-cache"}
-         :body (json/write-str
-                {:error prusalink-request-error})}))))
-
-(defn- first-header
-  "Return the first header value from a PrusaLink response header map."
-  [headers header-name default-value]
-  (or (first (get headers header-name))
-      (first (get headers (str/lower-case header-name)))
-      default-value))
-
-(defn- prusalink-media-proxy-handler
-  "Proxy safe PrusaLink media paths, currently thumbnails."
-  [req]
-  (let [prefix "/api/prusalink/proxy"
-        uri (:uri req)
-        target-path (subs uri (count prefix))]
-    (if-not (str/starts-with? target-path "/thumb/")
-      {:status 400
-       :headers {"Content-Type" "application/json"
-                 "Cache-Control" "no-cache"}
-       :body (json/write-str {:error "Unsupported PrusaLink proxy path"})}
-      (try
-        (let [{:keys [status headers body]} (prusalink/request-bytes target-path)]
-          {:status status
-           :headers {"Content-Type" (first-header headers "content-type" "application/octet-stream")
-                     "Cache-Control" "no-cache"}
-           :body body})
-        (catch Exception e
-          (println "PrusaLink media proxy request failed:" (.getMessage e))
-          {:status 502
-           :headers {"Content-Type" "application/json"
-                     "Cache-Control" "no-cache"}
-           :body (json/write-str {:error prusalink-request-error})})))))
 
 (defn- js-asset-handler
   "Serve compiled ClojureScript assets from resources/js for direct backend access."
@@ -690,11 +258,11 @@
    "/replay" dashboard-handler
    "/ws" (websocket-handler telemetry-stream)
    "/api/telemetry-files" list-telemetry-files-handler
-   "/api/prusalink/auth" prusalink-auth-status-handler
-   "/api/prusalink/print-state" prusalink-print-state-handler
-   "/api/prusalink/status" (prusalink-proxy-handler "/api/v1/status")
-   "/api/prusalink/job" (prusalink-proxy-handler "/api/v1/job")
-   "/api/prusalink/connection" (prusalink-proxy-handler "/api/connection")
+   "/api/prusalink/auth" prusalink-proxy/auth-status-handler
+   "/api/prusalink/print-state" (prusalink-proxy/print-state-handler prusalink-print-state)
+   "/api/prusalink/status" (prusalink-proxy/proxy-handler "/api/v1/status")
+   "/api/prusalink/job" (prusalink-proxy/proxy-handler "/api/v1/job")
+   "/api/prusalink/connection" (prusalink-proxy/proxy-handler "/api/connection")
    "/app.js" app-js-handler})
 
 (defn- create-request-handler
@@ -722,7 +290,7 @@
           (str/starts-with? uri "/api/prusalink/proxy/")
           (do
             (println "Matched prusalink proxy pattern")
-            (prusalink-media-proxy-handler req))
+            (prusalink-proxy/media-proxy-handler req))
 
           (str/starts-with? uri "/js/")
           (do
@@ -787,7 +355,7 @@
   (setup-packet-saving-consumer telemetry-stream)
   
   ;; Create routes and handler
-  (let [stop-prusalink-poller! (start-prusalink-print-state-poller!)
+  (let [stop-prusalink-poller! (prusalink-state/start-poller! prusalink-print-state)
         routes (create-routes telemetry-stream)
         handler (create-request-handler routes)
         server (start-http-server handler port)]
