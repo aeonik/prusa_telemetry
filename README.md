@@ -63,7 +63,7 @@ If an HTTP proxy blocks either `download.clojure.org` (Clojure installer) or `re
 Compile the ClojureScript frontend to JavaScript:
 
 ```bash
-clj -M:cljs build-cljs.clj
+clojure -M:shadow-cljs compile app
 ```
 
 This generates:
@@ -157,7 +157,7 @@ clj -M:run-m 8514
 ### Run Tests
 
 ```bash
-clojure -X:test/run
+clojure -M:test
 ```
 
 ### Build Uberjar
@@ -165,10 +165,13 @@ clojure -X:test/run
 Create a standalone JAR file:
 
 ```bash
+clojure -M:shadow-cljs compile app
 clojure -T:build ci
 ```
 
 This creates `target/prusa_telemetry-0.1.0-SNAPSHOT.jar`
+with `aeonik.web-server` as the entrypoint, so it starts both the UDP
+telemetry listener and HTTP dashboard/archive server.
 
 Run the uberjar:
 
@@ -182,7 +185,7 @@ java -jar target/prusa_telemetry-0.1.0-SNAPSHOT.jar [telemetry-port] [web-port]
 
 1. **Build the frontend**:
    ```bash
-   clj -M:cljs build-cljs.clj
+   clojure -M:shadow-cljs compile app
    ```
 
 2. **Start the server**:
@@ -273,7 +276,7 @@ prusa_telemetry/
 │   └── app.js             # Generated ClojureScript loader
 ├── target/                 # Build artifacts
 │   └── cljs-out/          # Compiled JavaScript
-├── build-cljs.clj         # ClojureScript build script
+├── shadow-cljs.edn        # ClojureScript build/dev server config
 └── deps.edn               # Dependencies
 ```
 
@@ -287,7 +290,7 @@ prusa_telemetry/
 ### Making Changes
 
 1. **Backend changes** (`src/`): Just restart the server
-2. **Frontend changes** (`src-cljs/`): Rebuild with `clj -M:cljs build-cljs.clj` then refresh browser
+2. **Frontend changes** (`src-cljs/`): Rebuild with `clojure -M:shadow-cljs compile app` then refresh browser
 3. **HTML/CSS changes** (`resources/index.html`): Just refresh browser
 
 ### Debugging

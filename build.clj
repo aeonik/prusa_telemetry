@@ -4,7 +4,7 @@
 
 (def lib 'net.clojars.aeonik/prusa_telemetry)
 (def version "0.1.0-SNAPSHOT")
-(def main 'aeonik.prusa-telemetry)
+(def main 'aeonik.web-server)
 
 (defn test "Run the tests." [opts]
   (bb/run-tests opts))
