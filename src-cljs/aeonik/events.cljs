@@ -271,9 +271,7 @@
 
 (defn- apply-replay-snapshot
   [state {:keys [token snapshot]}]
-  (if (and (replay-state-token-active? state token)
-           (or (nil? (:selected-packet-msg state))
-               (= (:packet-msg snapshot) (:selected-packet-msg state))))
+  (if (replay-state-token-active? state token)
     (assoc-in state [:replay :snapshot] snapshot)
     state))
 

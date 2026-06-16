@@ -734,7 +734,10 @@
 (defn- replay-correlation [gcode-data replay-data snapshot packet-range current-packet-msg]
   (let [segments (:segments gcode-data)
         sdpos-metric (if (:worker-backed? replay-data)
-                       (snapshot-metric-by-names snapshot sdpos-metric-names)
+                       (or (metric-at-or-before (:metric-cards replay-data)
+                                                sdpos-metric-names
+                                                current-packet-msg)
+                           (snapshot-metric-by-names snapshot sdpos-metric-names))
                        (metric-at-or-before (:metric-cards replay-data)
                                             sdpos-metric-names
                                             current-packet-msg))
@@ -761,21 +764,22 @@
 (defn- replay-metric-card [summary current-packet-msg snapshot-card]
   (let [latest (:latest summary)
         sample-backed? (some? (:packet-msgs summary))
-        selected-sample (or (:selected-sample snapshot-card)
-                            (when sample-backed?
-                              (replay-index/sample-at-or-before summary current-packet-msg)))
-        selected-event (or (:selected-event snapshot-card)
-                           (when sample-backed?
-                             (replay-index/sample->event summary selected-sample)))
+        local-sample (when sample-backed?
+                       (replay-index/sample-at-or-before summary current-packet-msg))
+        selected-sample (or local-sample
+                            (:selected-sample snapshot-card))
+        selected-event (or (when local-sample
+                             (replay-index/sample->event summary local-sample))
+                           (:selected-event snapshot-card))
         numeric-values (cond
-                         snapshot-card
-                         (or (:numeric-values snapshot-card) [])
-
                          sample-backed?
                          (replay-index/numeric-window-values-at
                           summary
                           current-packet-msg
                           replay-spark-window)
+
+                         snapshot-card
+                         (or (:numeric-values snapshot-card) [])
 
                          :else
                          [])
@@ -897,7 +901,7 @@
         _ (when (and (:worker-backed? replay-data)
                      current-packet-msg
                      (not (snapshot-current? replay-snapshot current-packet-msg)))
-            (files/request-replay-snapshot! current-packet-msg replay-spark-window))
+            (files/request-replay-snapshot! current-packet-msg 0))
         display-snapshot (or active-snapshot replay-snapshot)
         snapshot-cards (snapshot-card-map display-snapshot)
         packet (if (:worker-backed? replay-data)

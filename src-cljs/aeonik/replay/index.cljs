@@ -49,35 +49,77 @@
    :offset-us (array)
    :device-time-us (array)})
 
+(defn- typed-array?
+  [values]
+  (or (instance? js/Int32Array values)
+      (instance? js/Float64Array values)))
+
+(defn- column-count
+  [values]
+  (cond
+    (nil? values)
+    0
+
+    (or (array? values) (typed-array? values))
+    (alength values)
+
+    :else
+    (count values)))
+
+(defn- column-value
+  [values idx]
+  (when values
+    (if (or (array? values) (typed-array? values))
+      (aget values idx)
+      (get values idx))))
+
 (defn- sample-count
   [series]
-  (if-let [packet-msgs (:packet-msgs series)]
-    (alength packet-msgs)
-    0))
+  (column-count (:packet-msgs series)))
+
+(def ^:private max-summary-samples 2048)
+
+(defn- preview-indexes
+  [sample-total]
+  (if (<= sample-total max-summary-samples)
+    (range sample-total)
+    (let [last-idx (dec sample-total)
+          last-preview-idx (dec max-summary-samples)]
+      (map (fn [idx]
+             (js/Math.round (* idx (/ last-idx last-preview-idx))))
+           (range max-summary-samples)))))
+
+(defn- int-column
+  [source indexes]
+  (mapv #(or (aget source %) 0) indexes))
+
+(defn- number-column
+  [source indexes]
+  (mapv #(or (aget source %) js/NaN) indexes))
 
 (defn- sample-at-index
   [series idx]
   (when (and (number? idx)
              (<= 0 idx)
              (< idx (sample-count series)))
-    (cond-> {:packet-msg (aget (:packet-msgs series) idx)}
-      (some? (aget (:values series) idx))
-      (assoc :value (aget (:values series) idx))
+    (cond-> {:packet-msg (column-value (:packet-msgs series) idx)}
+      (some? (column-value (:values series) idx))
+      (assoc :value (column-value (:values series) idx))
 
-      (some? (aget (:tags series) idx))
-      (assoc :tags (aget (:tags series) idx))
+      (some? (column-value (:tags series) idx))
+      (assoc :tags (column-value (:tags series) idx))
 
-      (some? (aget (:fields series) idx))
-      (assoc :fields (aget (:fields series) idx))
+      (some? (column-value (:fields series) idx))
+      (assoc :fields (column-value (:fields series) idx))
 
-      (some? (aget (:errors series) idx))
-      (assoc :error (aget (:errors series) idx))
+      (some? (column-value (:errors series) idx))
+      (assoc :error (column-value (:errors series) idx))
 
-      (some? (aget (:offset-us series) idx))
-      (assoc :offset-us (aget (:offset-us series) idx))
+      (some? (column-value (:offset-us series) idx))
+      (assoc :offset-us (column-value (:offset-us series) idx))
 
-      (some? (aget (:device-time-us series) idx))
-      (assoc :device-time-us (aget (:device-time-us series) idx)))))
+      (some? (column-value (:device-time-us series) idx))
+      (assoc :device-time-us (column-value (:device-time-us series) idx)))))
 
 (defn- append-sample!
   [series {:keys [packet-msg value tags fields error offset-us device-time-us]}]
@@ -262,20 +304,29 @@
    :packet-metadata (count (:packets index))})
 
 (defn series-summary
-  "Return the display-safe metadata for one replay metric series.
-   Sample columns are intentionally omitted so worker-backed replay state stays small."
+  "Return display-safe metadata for one replay metric series.
+   Numeric packet/value preview columns are retained so scrubbing
+   can update synchronously without keeping the full archive in app-state."
   [series]
-  (select-keys (finalize-series series)
-               [:key
-                :sender
-                :name
-                :type
-                :print-filename
-                :numeric?
-                :sample-count
-                :event-count
-                :stats
-                :latest]))
+  (let [series (finalize-series series)
+        indexes (preview-indexes (sample-count series))
+        summary (select-keys series
+                             [:key
+                              :sender
+                              :name
+                              :type
+                              :print-filename
+                              :numeric?
+                              :sample-count
+                              :event-count
+                              :stats
+                              :latest])]
+    (cond-> summary
+      (:numeric? series)
+      (assoc :packet-msgs (int-column (:packet-msgs series) indexes)
+             :values (number-column (:values series) indexes)
+             :preview? true
+             :preview-sample-count (count indexes)))))
 
 (defn finalize
   "Finalize an incremental replay index build for app-state."
@@ -326,7 +377,7 @@
         (if (> lo hi)
           best
           (let [mid (js/Math.floor (/ (+ lo hi) 2))
-                sample-msg (aget packet-msgs mid)]
+                sample-msg (column-value packet-msgs mid)]
             (if (and (number? sample-msg) (<= sample-msg packet-msg))
               (recur (inc mid) hi mid)
               (recur lo (dec mid) best))))))))
@@ -362,7 +413,7 @@
             start (max 0 (- end limit))]
         (->> (range start end)
              (keep (fn [sample-idx]
-                     (let [value (aget values sample-idx)]
+                     (let [value (column-value values sample-idx)]
                        (when (te/finite-number? value)
                          value))))
              vec))
@@ -388,7 +439,7 @@
                      acc '()]
                 (if (and (number? idx)
                          (>= idx 0)
-                         (= packet-msg (aget packet-msgs idx)))
+                         (= packet-msg (column-value packet-msgs idx)))
                   (recur (dec idx)
                          (conj acc (sample->event series (sample-at-index series idx))))
                   acc)))))
