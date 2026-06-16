@@ -2,6 +2,7 @@
   "FlowStorm preload with compatibility wrappers for the current debugger runtime."
   (:require [cljs.storm.tracer :as storm-tracer]
             [flow-storm.api :as fs-api]
+            [flow-storm.runtime.indexes.api :as fs-indexes]
             [flow-storm.tracer :as fs-tracer]))
 
 (defn- install-trace-hooks!
@@ -28,4 +29,5 @@
     (js/console.log "ClojureScriptStorm not detected.")))
 
 (fs-api/setup-runtime)
+(fs-indexes/get-or-create-thread-indexes nil 0 "main" nil)
 (fs-api/remote-connect {})

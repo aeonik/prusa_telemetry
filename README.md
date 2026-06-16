@@ -154,6 +154,14 @@ remote debugger automatically. Frontend ClojureScript connects from the browser
 through the debug preload, so refresh `http://localhost:9632` after starting
 debug mode.
 
+Browser tracing is intentionally narrow by default to avoid recording huge
+render/replay values into the browser heap. The default traced CLJS namespaces
+are `aeonik.prusalink,aeonik.ws`. Override with:
+
+```bash
+FLOW_STORM_CLJS_PREFIXES=aeonik.prusalink,aeonik.ws,aeonik.timeline bin/dev-service debug
+```
+
 The debug service uses `flow-storm-shim.preload` instead of FlowStorm's stock
 preload because the current patched ClojureScript hook arity is newer than the
 published `flow-storm-dbg` runtime hook arity.

@@ -15,6 +15,7 @@ BACKEND_ALIASES="${BACKEND_ALIASES:-:dev${CLJ_EXTRA_ALIASES}:dev-service}"
 SHADOW_ALIASES="${SHADOW_ALIASES:-:shadow-cljs${CLJ_EXTRA_ALIASES}}"
 SERVICE_CONFIG_FILE="$ROOT/log/dev-service.env"
 FLOW_STORM_DEBUGGER="${FLOW_STORM_DEBUGGER:-false}"
+FLOW_STORM_CLJS_PREFIXES="${FLOW_STORM_CLJS_PREFIXES:-aeonik.prusalink,aeonik.ws}"
 SHADOW_FORCE_SPAWN="${SHADOW_FORCE_SPAWN:-false}"
 SHADOW_CONFIG_MERGE="{}"
 
@@ -53,6 +54,7 @@ shadow aliases:  ${SHADOW_ALIASES}
 shadow config:   ${SHADOW_CONFIG_MERGE}
 shadow fresh:    ${SHADOW_FORCE_SPAWN}
 flowstorm gui:   ${FLOW_STORM_DEBUGGER}
+cljs storm ns:   ${FLOW_STORM_CLJS_PREFIXES}
 EOF
 }
 
@@ -82,9 +84,13 @@ start_service() {
   if [[ "$SHADOW_FORCE_SPAWN" == "true" ]]; then
     shadow_spawn_arg="--force-spawn"
   fi
+  local shadow_env=""
+  if [[ "$SHADOW_ALIASES" == *":clojurestorm"* ]]; then
+    shadow_env="env JAVA_TOOL_OPTIONS='${JAVA_TOOL_OPTIONS:-} -Dcljs.storm.instrumentAutoPrefixes=false -Dcljs.storm.instrumentOnlyPrefixes=${FLOW_STORM_CLJS_PREFIXES}'"
+  fi
 
   tmux new-window -t "${SESSION}:" -c "$ROOT" -n shadow \
-    "clojure -M${SHADOW_ALIASES} ${shadow_spawn_arg} --config-merge '${SHADOW_CONFIG_MERGE}' watch app 2>&1 | tee -a log/dev-shadow.log"
+    "${shadow_env} clojure -M${SHADOW_ALIASES} ${shadow_spawn_arg} --config-merge '${SHADOW_CONFIG_MERGE}' watch app 2>&1 | tee -a log/dev-shadow.log"
 
   start_storm_debugger
 
@@ -170,6 +176,7 @@ Environment:
   SHADOW_HTTP_PORT=${SHADOW_HTTP_PORT}
   CLJ_EXTRA_ALIASES=${CLJ_EXTRA_ALIASES}    # appended to backend and shadow aliases
   FLOW_STORM_DEBUGGER=${FLOW_STORM_DEBUGGER}
+  FLOW_STORM_CLJS_PREFIXES=${FLOW_STORM_CLJS_PREFIXES}
   BACKEND_ALIASES=${BACKEND_ALIASES}
   SHADOW_ALIASES=${SHADOW_ALIASES}
 EOF
